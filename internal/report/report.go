@@ -57,11 +57,23 @@ func summarize(r *tlsscan.Report) status {
 	if !r.Leaf.Expired && !r.Leaf.NotYetValid && r.Leaf.DaysRemaining <= r.WarnDays {
 		problems = append(problems, expiringStatus(r.Leaf.DaysRemaining))
 	}
+	if r.DeadSANs > 0 {
+		problems = append(problems, deadSANStatus(r.DeadSANs))
+		worst = colorRed
+	}
 
 	if len(problems) == 0 {
 		return status{text: "VALID", color: colorGreen}
 	}
 	return status{text: strings.Join(problems, " | "), color: worst}
+}
+
+// deadSANStatus renders the count of dead/stale SAN names for the headline.
+func deadSANStatus(n int) string {
+	if n == 1 {
+		return "1 DEAD SAN"
+	}
+	return fmt.Sprintf("%d DEAD SANS", n)
 }
 
 // paint wraps s in an ANSI color when enabled, otherwise returns it
@@ -139,6 +151,17 @@ func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
 
 	tw.Flush()
 
+	if len(r.SANChecks) > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "  SAN liveness:")
+		stw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+		for _, c := range r.SANChecks {
+			addrs, state, stColor := sanLiveness(c)
+			fmt.Fprintf(stw, "    %s\t%s\t%s\n", c.Name, addrs, paint(state, stColor, color))
+		}
+		stw.Flush()
+	}
+
 	if len(r.Chain) > 0 {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "  Chain:")
@@ -158,6 +181,42 @@ func WriteJSON(w io.Writer, r *tlsscan.Report) error {
 		return fmt.Errorf("encode report: %w", err)
 	}
 	return nil
+}
+
+// sanLiveness renders one SAN check as an address list, a state word, and the
+// color for that state. A name is "open" when every resolved address is
+// reachable, "partial" when only some are (for example an unreachable IPv6
+// address alongside a reachable IPv4 one), "unreachable" when none are, and
+// "NO DNS" when it does not resolve at all. Wildcard names are not probed.
+func sanLiveness(c tlsscan.SANCheck) (addrs, state, color string) {
+	if c.Wildcard {
+		return "-", "wildcard (not probed)", ""
+	}
+	if !c.Resolved {
+		return "-", "NO DNS (stale?)", colorRed
+	}
+
+	parts := make([]string, 0, len(c.Addrs))
+	anyUp, allUp := false, true
+	for _, a := range c.Addrs {
+		if a.Reachable {
+			anyUp = true
+			parts = append(parts, a.IP)
+		} else {
+			allUp = false
+			parts = append(parts, a.IP+" (down)")
+		}
+	}
+	addrs = strings.Join(parts, ", ")
+
+	switch {
+	case !anyUp:
+		return addrs, "unreachable", colorRed
+	case !allUp:
+		return addrs, "partial", colorYellow
+	default:
+		return addrs, "open", colorGreen
+	}
 }
 
 // expiryColor chooses the color for the validity row based on the

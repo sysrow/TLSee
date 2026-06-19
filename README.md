@@ -13,6 +13,12 @@ certificates. Trust and hostname matching are then evaluated and reported as
 separate facts. It works against public hosts and internal targets alike
 (`localhost:8443`, `127.0.0.1`, internal IPs).
 
+By default it also performs a **SAN liveness check**: every DNS name in the
+certificate's SAN list is resolved (A/AAAA) and TCP-probed on the scanned port,
+so dead or stale entries are surfaced -- a name that no longer resolves, or
+whose host is unreachable. This catches names left on a certificate after the
+service behind them was decommissioned.
+
 Built with the Go standard library only. No third-party dependencies.
 
 ## Build
@@ -54,10 +60,29 @@ tlsee version
 | `--json`      | `false` | Emit JSON instead of text.                                   |
 | `--color`     | `auto`  | Color output: `auto`, `always`, or `never`.                  |
 | `--warn-days` | `30`    | Warn when the certificate expires within this many days.     |
+| `--no-check`  | `false` | Skip the SAN liveness check (resolve + TCP-probe of each name).|
 | `--insecure`  | `false` | Always exit `0` even when the certificate has problems.      |
 
 Color is emitted only when `--color=always`, or when `--color=auto` and stdout
 is a terminal and `NO_COLOR` is unset. JSON output is never colored.
+
+## SAN liveness
+
+For each DNS name in the certificate's SAN list, `tlsee` reports one of:
+
+| State                   | Meaning                                                        |
+| ----------------------- | ------------------------------------------------------------- |
+| `open`                  | Resolves and every address accepts a connection on the port.  |
+| `partial`               | Resolves and some addresses are reachable (e.g. IPv4 up, IPv6 down). |
+| `unreachable`           | Resolves but no address accepts a connection.                 |
+| `NO DNS (stale?)`       | Does not resolve at all -- likely a stale name on the cert.   |
+| `wildcard (not probed)` | A `*.` name, which cannot be resolved directly.               |
+
+Names that are `unreachable` or `NO DNS` are counted as **dead SANs** and shown
+in the status headline. Each probe uses a short timeout (capped at 3s) and runs
+concurrently. Dead SANs are reported but do **not** change the exit code, which
+reflects the certificate's own validity. Use `--no-check` to skip the check for
+a faster scan.
 
 ## Exit codes
 

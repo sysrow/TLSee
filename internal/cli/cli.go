@@ -72,6 +72,7 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		colorMode = fs.String("color", "auto", "color output: auto|always|never")
 		warnDays  = fs.Int("warn-days", 30, "warn when a certificate expires within this many days")
 		insecure  = fs.Bool("insecure", false, "always exit 0 even when the certificate has problems")
+		noCheck   = fs.Bool("no-check", false, "skip SAN liveness checks (resolve + TCP-probe of each certificate name)")
 	)
 
 	fs.Usage = func() { printScanUsage(stderr, fs) }
@@ -108,6 +109,7 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		Timeout:    *timeout,
 		ServerName: *sni,
 		ResolveDNS: true,
+		CheckSANs:  !*noCheck,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "tlsee scan: %v\n", err)
@@ -243,7 +245,14 @@ Scan flags:
   --json              emit JSON instead of text
   --color MODE        auto|always|never (default auto)
   --warn-days N       warn when expiring within N days (default 30)
+  --no-check          skip SAN liveness checks (on by default)
   --insecure          always exit 0 even when the certificate has problems
+
+By default tlsee also resolves and TCP-probes every DNS name in the
+certificate's SAN list and reports dead or stale entries (a name that no
+longer resolves, or whose host is unreachable on the port). Dead SANs are
+shown but do not change the exit code, which reflects the certificate's own
+validity. Use --no-check to skip this.
 
 Exit codes:
   0  healthy: trusted chain, hostname matches, valid, and not expiring soon

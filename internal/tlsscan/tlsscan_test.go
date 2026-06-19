@@ -2,12 +2,66 @@ package tlsscan
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+// TestProbeAddr exercises the deterministic core of the SAN liveness check
+// using IP literals only (no DNS): a bound listener is reachable, and a port
+// that was bound then closed is refused.
+func TestProbeAddr(t *testing.T) {
+	ctx := context.Background()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	_, openPort, _ := net.SplitHostPort(ln.Addr().String())
+
+	if ok, err := probeAddr(ctx, "127.0.0.1", openPort, time.Second); !ok || err != nil {
+		t.Errorf("probeAddr(open) = (%v, %v); want (true, nil)", ok, err)
+	}
+
+	// Bind a second port, then close it so it is guaranteed not listening.
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	_, closedPort, _ := net.SplitHostPort(ln2.Addr().String())
+	ln2.Close()
+
+	if ok, err := probeAddr(ctx, "127.0.0.1", closedPort, time.Second); ok || err == nil {
+		t.Errorf("probeAddr(closed) = (%v, %v); want (false, non-nil)", ok, err)
+	}
+}
+
+// TestCheckSANWildcard verifies a wildcard name is flagged and not probed,
+// so it can be excluded from the dead-SAN count.
+func TestCheckSANWildcard(t *testing.T) {
+	sc := checkSAN(context.Background(), "*.example.com", "443", time.Second)
+	if !sc.Wildcard {
+		t.Errorf("Wildcard = false; want true for %q", sc.Name)
+	}
+	if sc.Resolved || sc.Reachable || len(sc.Addrs) != 0 {
+		t.Errorf("wildcard probed: %+v; want no resolution or addresses", sc)
+	}
+}
+
+// TestProbeTimeout checks the per-probe timeout is capped below the handshake
+// timeout but honors a smaller scan timeout.
+func TestProbeTimeout(t *testing.T) {
+	if got := probeTimeout(10 * time.Second); got != maxProbeTimeout {
+		t.Errorf("probeTimeout(10s) = %v; want %v", got, maxProbeTimeout)
+	}
+	if got := probeTimeout(time.Second); got != time.Second {
+		t.Errorf("probeTimeout(1s) = %v; want 1s", got)
+	}
+}
 
 func TestParseTarget(t *testing.T) {
 	tests := []struct {

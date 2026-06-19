@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,6 +32,10 @@ type Options struct {
 	// ResolveDNS controls whether the host's A/AAAA records are looked up.
 	// It is ignored for IP literals.
 	ResolveDNS bool
+	// CheckSANs controls whether each DNS name in the certificate's SAN list
+	// is resolved (A/AAAA) and TCP-probed on the scanned port to detect dead
+	// or stale entries. Wildcard SAN names are reported but not probed.
+	CheckSANs bool
 }
 
 // CertInfo describes a single parsed certificate.
@@ -49,6 +54,24 @@ type CertInfo struct {
 	SignatureAlgorithm string    `json:"signatureAlgorithm"`
 	PublicKeyAlgorithm string    `json:"publicKeyAlgorithm"`
 	FingerprintSHA256  string    `json:"fingerprintSHA256"`
+}
+
+// AddrCheck is the liveness result for a single resolved address.
+type AddrCheck struct {
+	IP        string `json:"ip"`
+	Reachable bool   `json:"reachable"`
+	Error     string `json:"error,omitempty"`
+}
+
+// SANCheck is the liveness result for one DNS name from a certificate's SAN
+// list: whether it resolves, and whether any resolved address accepts a TCP
+// connection on the scanned port. Wildcard names are flagged and not probed.
+type SANCheck struct {
+	Name      string      `json:"name"`
+	Wildcard  bool        `json:"wildcard"`
+	Resolved  bool        `json:"resolved"`
+	Reachable bool        `json:"reachable"`
+	Addrs     []AddrCheck `json:"addrs,omitempty"`
 }
 
 // Report is the full result of scanning a target.
@@ -70,12 +93,23 @@ type Report struct {
 	// rendering and exit-code logic share a single source of truth without
 	// depending on the wall clock.
 	WarnDays int `json:"warnDays"`
+	// SANChecks holds the per-name liveness results when CheckSANs is set.
+	SANChecks []SANCheck `json:"sanChecks,omitempty"`
+	// DeadSANs counts non-wildcard SAN names that did not resolve or whose
+	// every resolved address was unreachable.
+	DeadSANs int `json:"deadSANs"`
 }
 
 const (
 	defaultPort     = "443"
 	defaultTimeout  = 10 * time.Second
 	defaultWarnDays = 30
+	// maxProbeTimeout bounds each SAN liveness probe independently of the
+	// handshake timeout, so a single dead or firewalled name cannot stall a
+	// scan for the full dial timeout.
+	maxProbeTimeout = 3 * time.Second
+	// sanProbeConcurrency caps how many SAN names are probed at once.
+	sanProbeConcurrency = 8
 )
 
 // Scan connects to target over TLS, retrieves the certificate chain, and
@@ -177,7 +211,96 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 		}
 	}
 
+	// SAN liveness: resolve and TCP-probe each certificate name to surface
+	// dead or stale entries (names left on the cert that no longer resolve or
+	// whose host is down). Probes run concurrently with their own short
+	// timeout so this never dominates scan latency.
+	if opts.CheckSANs && len(report.Leaf.DNSNames) > 0 {
+		report.SANChecks = checkSANs(ctx, report.Leaf.DNSNames, port, probeTimeout(timeout))
+		for _, c := range report.SANChecks {
+			if !c.Wildcard && (!c.Resolved || !c.Reachable) {
+				report.DeadSANs++
+			}
+		}
+	}
+
 	return report, nil
+}
+
+// probeTimeout derives the per-probe timeout from the scan timeout, capped so
+// a single dead name cannot block a scan for the whole dial timeout.
+func probeTimeout(timeout time.Duration) time.Duration {
+	if timeout < maxProbeTimeout {
+		return timeout
+	}
+	return maxProbeTimeout
+}
+
+// checkSANs probes every name concurrently, preserving input order. Each
+// goroutine writes its own slot, so no synchronization beyond the WaitGroup
+// is needed.
+func checkSANs(ctx context.Context, names []string, port string, timeout time.Duration) []SANCheck {
+	checks := make([]SANCheck, len(names))
+	sem := make(chan struct{}, sanProbeConcurrency)
+	var wg sync.WaitGroup
+	for i, name := range names {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, name string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			checks[i] = checkSAN(ctx, name, port, timeout)
+		}(i, name)
+	}
+	wg.Wait()
+	return checks
+}
+
+// checkSAN resolves a single SAN name and TCP-probes each resolved address.
+// Wildcard names (for example "*.example.com") cannot be resolved as-is, so
+// they are reported but not probed.
+func checkSAN(ctx context.Context, name, port string, timeout time.Duration) SANCheck {
+	sc := SANCheck{Name: name}
+	if strings.HasPrefix(name, "*.") {
+		sc.Wildcard = true
+		return sc
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(lookupCtx, "ip", name)
+	if err != nil || len(ips) == 0 {
+		return sc // Resolved stays false.
+	}
+	sc.Resolved = true
+
+	for _, ip := range ips {
+		ok, probeErr := probeAddr(ctx, ip.String(), port, timeout)
+		ac := AddrCheck{IP: ip.String(), Reachable: ok}
+		if !ok && probeErr != nil {
+			ac.Error = probeErr.Error()
+		}
+		if ok {
+			sc.Reachable = true
+		}
+		sc.Addrs = append(sc.Addrs, ac)
+	}
+	return sc
+}
+
+// probeAddr reports whether a TCP connection to ip:port can be established
+// within timeout. It is the deterministic core of the liveness check and
+// takes an IP literal so it performs no name resolution itself.
+func probeAddr(ctx context.Context, ip, port string, timeout time.Duration) (bool, error) {
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	dialer := net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(dialCtx, "tcp", net.JoinHostPort(ip, port))
+	if err != nil {
+		return false, err
+	}
+	conn.Close()
+	return true, nil
 }
 
 // parseTarget splits a target into host and port. It strips a leading

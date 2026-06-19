@@ -186,6 +186,94 @@ func TestSummarizeHostnameMismatchColor(t *testing.T) {
 	}
 }
 
+// reportWithSANChecks returns the valid fixture augmented with a mix of SAN
+// liveness outcomes: open, partial (IPv6 down), dead (no DNS), and wildcard.
+func reportWithSANChecks() *tlsscan.Report {
+	r := fixedReport()
+	r.SANChecks = []tlsscan.SANCheck{
+		{Name: "ok.example.com", Resolved: true, Reachable: true, Addrs: []tlsscan.AddrCheck{{IP: "10.0.0.1", Reachable: true}}},
+		{Name: "partial.example.com", Resolved: true, Reachable: true, Addrs: []tlsscan.AddrCheck{
+			{IP: "10.0.0.2", Reachable: true},
+			{IP: "fe80::1", Reachable: false, Error: "timeout"},
+		}},
+		{Name: "dead.example.com", Resolved: false},
+		{Name: "*.example.com", Wildcard: true},
+	}
+	r.DeadSANs = 1 // only dead.example.com
+	return r
+}
+
+func TestWriteTextSANLiveness(t *testing.T) {
+	var buf bytes.Buffer
+	WriteText(&buf, reportWithSANChecks(), false)
+	out := buf.String()
+
+	wantContains := []string{
+		"SAN liveness:",
+		"ok.example.com", "open",
+		"partial.example.com", "partial", "fe80::1 (down)",
+		"dead.example.com", "NO DNS (stale?)",
+		"wildcard (not probed)",
+		"1 DEAD SAN", // status headline
+	}
+	for _, w := range wantContains {
+		if !strings.Contains(out, w) {
+			t.Errorf("WriteText output missing %q\n---\n%s", w, out)
+		}
+	}
+}
+
+// TestWriteTextSANLivenessColor confirms the SAN-liveness section is colored
+// when color is enabled (a dead name renders red).
+func TestWriteTextSANLivenessColor(t *testing.T) {
+	var buf bytes.Buffer
+	WriteText(&buf, reportWithSANChecks(), true)
+	if !strings.Contains(buf.String(), colorRed+"NO DNS (stale?)"+colorReset) {
+		t.Errorf("dead SAN not rendered in red with color enabled\n---\n%s", buf.String())
+	}
+}
+
+// TestSummarizeDeadSANs verifies a dead SAN turns an otherwise-valid status
+// red and is reported, while a wildcard-only report stays VALID.
+func TestSummarizeDeadSANs(t *testing.T) {
+	r := reportWithSANChecks()
+	st := summarize(r)
+	if st.color != colorRed {
+		t.Errorf("dead-SAN status color = %q; want red %q", st.color, colorRed)
+	}
+	if !strings.Contains(st.text, "1 DEAD SAN") {
+		t.Errorf("status = %q; want it to mention the dead SAN", st.text)
+	}
+
+	// Wildcard-only (no dead SANs) must not affect a valid status.
+	clean := fixedReport()
+	clean.SANChecks = []tlsscan.SANCheck{{Name: "*.example.com", Wildcard: true}}
+	clean.DeadSANs = 0
+	if st := summarize(clean); st.text != "VALID" {
+		t.Errorf("wildcard-only status = %q; want VALID", st.text)
+	}
+}
+
+func TestWriteJSONSANChecks(t *testing.T) {
+	var buf bytes.Buffer
+	if err := WriteJSON(&buf, reportWithSANChecks()); err != nil {
+		t.Fatalf("WriteJSON error: %v", err)
+	}
+	var got tlsscan.Report
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("JSON did not round-trip: %v", err)
+	}
+	if len(got.SANChecks) != 4 {
+		t.Fatalf("SANChecks length = %d; want 4", len(got.SANChecks))
+	}
+	if got.DeadSANs != 1 {
+		t.Errorf("DeadSANs = %d; want 1", got.DeadSANs)
+	}
+	if !got.SANChecks[3].Wildcard {
+		t.Errorf("fourth SAN check should be wildcard: %+v", got.SANChecks[3])
+	}
+}
+
 func TestWriteJSON(t *testing.T) {
 	var buf bytes.Buffer
 	if err := WriteJSON(&buf, fixedReport()); err != nil {

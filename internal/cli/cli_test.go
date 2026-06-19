@@ -11,23 +11,31 @@ import (
 	"tlsee/internal/tlsscan"
 )
 
-// TestParseInterspersed verifies the target is extracted no matter where the
-// flags sit relative to it, so "scan host --json" and "scan --json host" are
-// both accepted.
+// TestParseInterspersed verifies positional targets are extracted no matter
+// where the flags sit relative to them, so "scan host --json" and
+// "scan --json host" are both accepted, and that multiple targets are collected
+// in order. Zero positional targets is not an error here: targets may instead
+// come from -f/--file, and the caller enforces "at least one overall".
 func TestParseInterspersed(t *testing.T) {
 	tests := []struct {
-		name       string
-		args       []string
-		wantTarget string
-		wantJSON   bool
-		wantErr    bool
+		name        string
+		args        []string
+		wantTargets []string
+		wantJSON    bool
+		wantErr     bool
 	}{
-		{name: "target only", args: []string{"example.com"}, wantTarget: "example.com"},
-		{name: "flag before target", args: []string{"--json", "example.com"}, wantTarget: "example.com", wantJSON: true},
-		{name: "flag after target", args: []string{"example.com", "--json"}, wantTarget: "example.com", wantJSON: true},
-		{name: "flags on both sides", args: []string{"--json", "example.com", "--color", "never"}, wantTarget: "example.com", wantJSON: true},
-		{name: "no target", args: []string{"--json"}, wantErr: true},
-		{name: "two targets", args: []string{"a", "b"}, wantErr: true},
+		{name: "target only", args: []string{"example.com"}, wantTargets: []string{"example.com"}},
+		{name: "flag before target", args: []string{"--json", "example.com"}, wantTargets: []string{"example.com"}, wantJSON: true},
+		{name: "flag after target", args: []string{"example.com", "--json"}, wantTargets: []string{"example.com"}, wantJSON: true},
+		{name: "flags on both sides", args: []string{"--json", "example.com", "--color", "never"}, wantTargets: []string{"example.com"}, wantJSON: true},
+		{name: "no positional target", args: []string{"--json"}, wantTargets: nil, wantJSON: true},
+		{name: "two targets", args: []string{"a", "b"}, wantTargets: []string{"a", "b"}},
+		{name: "two targets around flag", args: []string{"a", "--json", "b"}, wantTargets: []string{"a", "b"}, wantJSON: true},
+		{name: "bad flag", args: []string{"--nope"}, wantErr: true},
+		// Everything after "--" is positional verbatim: the "--json" following
+		// "--" is a literal target, not a flag, so json stays false.
+		{name: "end-of-flags terminator", args: []string{"a", "--", "b", "--json"}, wantTargets: []string{"a", "b", "--json"}},
+		{name: "terminator before all positionals", args: []string{"--", "a", "--json"}, wantTargets: []string{"a", "--json"}},
 	}
 
 	for _, tc := range tests {
@@ -37,24 +45,38 @@ func TestParseInterspersed(t *testing.T) {
 			asJSON := fs.Bool("json", false, "")
 			fs.String("color", "auto", "")
 
-			target, err := parseInterspersed(fs, tc.args)
+			targets, err := parseInterspersed(fs, tc.args)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("parseInterspersed(%v) = (%q, nil); want error", tc.args, target)
+					t.Fatalf("parseInterspersed(%v) = (%v, nil); want error", tc.args, targets)
 				}
 				return
 			}
 			if err != nil {
 				t.Fatalf("parseInterspersed(%v) unexpected error: %v", tc.args, err)
 			}
-			if target != tc.wantTarget {
-				t.Errorf("target = %q; want %q", target, tc.wantTarget)
+			if !equalStrings(targets, tc.wantTargets) {
+				t.Errorf("targets = %v; want %v", targets, tc.wantTargets)
 			}
 			if *asJSON != tc.wantJSON {
 				t.Errorf("json = %v; want %v", *asJSON, tc.wantJSON)
 			}
 		})
 	}
+}
+
+// equalStrings reports whether two string slices have the same elements in the
+// same order, treating nil and empty as equal.
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // healthyReport returns a report that passes every health predicate, so each

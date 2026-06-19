@@ -9,6 +9,9 @@ package tlsscan
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -36,12 +39,24 @@ type Options struct {
 	// is resolved (A/AAAA) and TCP-probed on the scanned port to detect dead
 	// or stale entries. Wildcard SAN names are reported but not probed.
 	CheckSANs bool
+	// StartTLS selects a plaintext-to-TLS upgrade protocol to negotiate before
+	// the handshake. The empty string (the default) means direct TLS. Valid
+	// values are: smtp, imap, pop3, ftp, postgres, ldap.
+	StartTLS string
+	// AllIPs controls whether, after the primary scan, every resolved A/AAAA
+	// address of the host is connected to individually (SNI set to the host)
+	// to retrieve its leaf certificate. This catches load-balancer backends
+	// serving a stale or mismatched certificate. It is ignored for IP literals.
+	AllIPs bool
 }
 
 // CertInfo describes a single parsed certificate.
 type CertInfo struct {
 	Subject            string    `json:"subject"`
 	Issuer             string    `json:"issuer"`
+	SubjectCN          string    `json:"subjectCommonName"`
+	IssuerCN           string    `json:"issuerCommonName"`
+	KeyBits            int       `json:"keyBits"`
 	SerialNumber       string    `json:"serialNumber"`
 	NotBefore          time.Time `json:"notBefore"`
 	NotAfter           time.Time `json:"notAfter"`
@@ -61,6 +76,20 @@ type AddrCheck struct {
 	IP        string `json:"ip"`
 	Reachable bool   `json:"reachable"`
 	Error     string `json:"error,omitempty"`
+}
+
+// IPCert is the leaf certificate retrieved from a single resolved address of
+// the host when AllIPs is set. It captures just enough to detect that backends
+// behind one name disagree (for example a load-balancer member serving a stale
+// certificate). Error is set instead of the certificate fields when the address
+// could not be reached or its handshake failed.
+type IPCert struct {
+	IP                string    `json:"ip"`
+	FingerprintSHA256 string    `json:"fingerprintSHA256,omitempty"`
+	SubjectCN         string    `json:"subjectCommonName,omitempty"`
+	NotAfter          time.Time `json:"notAfter,omitempty"`
+	DaysRemaining     int       `json:"daysRemaining,omitempty"`
+	Error             string    `json:"error,omitempty"`
 }
 
 // SANCheck is the liveness result for one DNS name from a certificate's SAN
@@ -98,6 +127,50 @@ type Report struct {
 	// DeadSANs counts non-wildcard SAN names that did not resolve or whose
 	// every resolved address was unreachable.
 	DeadSANs int `json:"deadSANs"`
+	// Warnings holds informational hygiene findings (weak TLS version, weak
+	// signature algorithm, weak RSA key, or a weak negotiated cipher suite).
+	// Warnings never change the exit code or the status headline.
+	Warnings []string `json:"warnings,omitempty"`
+	// IPCerts holds the per-address leaf certificates retrieved when AllIPs is
+	// set. It is empty for IP literals and single-address hosts.
+	IPCerts []IPCert `json:"ipCerts,omitempty"`
+	// IPCertsDiffer is true when the reachable addresses in IPCerts do not all
+	// present the same leaf fingerprint. It is always serialized (no omitempty)
+	// so a JSON consumer can distinguish "checked, all agree" (false) from a
+	// scan that did not run the per-IP comparison (IPCerts absent).
+	IPCertsDiffer bool `json:"ipCertsDiffer"`
+}
+
+// SweepOptions controls a multi-port sweep of a single host.
+type SweepOptions struct {
+	// Ports is the explicit list of ports to probe. When empty, the curated
+	// default port table is used.
+	Ports []int
+	// Timeout bounds each per-port probe (TCP connect plus any STARTTLS and
+	// handshake). Defaults to defaultSweepTimeout so closed ports fail fast.
+	Timeout time.Duration
+	// Concurrency caps how many ports are probed at once. Defaults to
+	// defaultSweepConcurrency.
+	Concurrency int
+}
+
+// PortResult is the outcome of probing a single port during a sweep.
+type PortResult struct {
+	Port          int       `json:"port"`
+	Proto         string    `json:"proto"`
+	Open          bool      `json:"open"`
+	TLS           bool      `json:"tls"`
+	SubjectCN     string    `json:"subjectCommonName,omitempty"`
+	NotAfter      time.Time `json:"notAfter,omitempty"`
+	DaysRemaining int       `json:"daysRemaining,omitempty"`
+	Expired       bool      `json:"expired,omitempty"`
+	Error         string    `json:"error,omitempty"`
+}
+
+// SweepResult is the full outcome of sweeping one host's ports.
+type SweepResult struct {
+	Host  string       `json:"host"`
+	Ports []PortResult `json:"ports"`
 }
 
 const (
@@ -110,6 +183,15 @@ const (
 	maxProbeTimeout = 3 * time.Second
 	// sanProbeConcurrency caps how many SAN names are probed at once.
 	sanProbeConcurrency = 8
+	// ipCertConcurrency caps how many per-IP certificate probes run at once.
+	ipCertConcurrency = 8
+	// defaultSweepTimeout bounds each per-port probe in a sweep, kept short so
+	// closed ports fail fast.
+	defaultSweepTimeout = 3 * time.Second
+	// defaultSweepConcurrency caps concurrent port probes for a curated sweep.
+	defaultSweepConcurrency = 64
+	// minRSABits is the smallest RSA modulus size not flagged as weak.
+	minRSABits = 2048
 )
 
 // Scan connects to target over TLS, retrieves the certificate chain, and
@@ -135,28 +217,25 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 
 	addr := net.JoinHostPort(host, port)
 
-	dialCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	dialer := &tls.Dialer{
-		NetDialer: &net.Dialer{Timeout: timeout},
-		Config: &tls.Config{
-			ServerName: sni,
-			// Verification is intentionally skipped so that any
-			// certificate can be retrieved and inspected.
-			InsecureSkipVerify: true,
-		},
-	}
-
 	start := time.Now()
-	rawConn, err := dialer.DialContext(dialCtx, "tcp", addr)
+	conn, err := dialPlaintext(ctx, addr, timeout)
 	if err != nil {
-		return nil, fmt.Errorf("connect %s: %w", addr, err)
+		return nil, err
 	}
-	conn := rawConn.(*tls.Conn)
 	defer conn.Close()
 
-	state := conn.ConnectionState()
+	if opts.StartTLS != "" {
+		if err := startTLSNegotiate(ctx, conn, opts.StartTLS, timeout); err != nil {
+			return nil, fmt.Errorf("starttls %s on %s: %w", opts.StartTLS, addr, err)
+		}
+	}
+
+	tlsConn, err := tlsHandshake(ctx, conn, sni, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("handshake %s: %w", addr, err)
+	}
+
+	state := tlsConn.ConnectionState()
 	elapsed := time.Since(start).Milliseconds()
 
 	if len(state.PeerCertificates) == 0 {
@@ -224,7 +303,59 @@ func Scan(ctx context.Context, target string, opts Options) (*Report, error) {
 		}
 	}
 
+	// Hygiene warnings are derived from already-known facts about the leaf and
+	// the negotiated connection. They are informational only and never change
+	// the exit code or status headline.
+	report.Warnings = hygieneWarnings(
+		state.Version,
+		report.Leaf.SignatureAlgorithm,
+		report.Leaf.PublicKeyAlgorithm,
+		report.Leaf.KeyBits,
+		state.CipherSuite,
+		report.CipherSuite,
+	)
+
+	// Per-IP certificates: connect to every resolved address (SNI=host) to
+	// detect backends serving a stale or mismatched certificate. Skipped for IP
+	// literals; only meaningful when more than one address resolves.
+	if opts.AllIPs && net.ParseIP(host) == nil {
+		report.IPCerts, report.IPCertsDiffer = probeIPCerts(ctx, host, port, sni, report.ResolvedIPs, probeTimeout(timeout))
+	}
+
 	return report, nil
+}
+
+// hygieneWarnings evaluates informational hardening findings from already-known
+// connection facts. It is a pure function of its inputs so it can be tested
+// without a network. version and cipher are the negotiated TLS protocol version
+// and cipher-suite identifier; cipherName is the human-readable suite name used
+// in the message; sigAlg and pubKeyAlgo are the leaf's algorithm strings; and
+// keyBits is the leaf public-key size (0 when unknown). Warnings never affect
+// the exit code.
+func hygieneWarnings(version uint16, sigAlg, pubKeyAlgo string, keyBits int, cipher uint16, cipherName string) []string {
+	var warnings []string
+
+	if version < tls.VersionTLS12 {
+		warnings = append(warnings, "weak TLS version: "+tlsVersionName(version))
+	}
+
+	upperSig := strings.ToUpper(sigAlg)
+	if strings.Contains(upperSig, "SHA1") || strings.Contains(upperSig, "MD5") {
+		warnings = append(warnings, "weak signature algorithm: "+sigAlg)
+	}
+
+	if pubKeyAlgo == "RSA" && keyBits > 0 && keyBits < minRSABits {
+		warnings = append(warnings, fmt.Sprintf("weak RSA key: %d bits", keyBits))
+	}
+
+	for _, suite := range tls.InsecureCipherSuites() {
+		if suite.ID == cipher {
+			warnings = append(warnings, "weak cipher suite: "+cipherName)
+			break
+		}
+	}
+
+	return warnings
 }
 
 // probeTimeout derives the per-probe timeout from the scan timeout, capped so
@@ -303,6 +434,103 @@ func probeAddr(ctx context.Context, ip, port string, timeout time.Duration) (boo
 	return true, nil
 }
 
+// probeIPCerts resolves every A/AAAA address of host and connects to each one
+// (with SNI set to sni) to retrieve its leaf certificate. It returns the
+// per-address results and whether the reachable addresses disagree on the leaf
+// fingerprint. Resolution failures or a single resolved address yield an empty
+// result, since there is nothing to compare.
+func probeIPCerts(ctx context.Context, host, port, sni string, resolved []string, timeout time.Duration) ([]IPCert, bool) {
+	// Reuse the addresses the scan already resolved; only fall back to a lookup
+	// when the caller has none (for example when DNS resolution was disabled for
+	// the main scan).
+	ips := resolved
+	if len(ips) == 0 {
+		lookupCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		looked, err := net.DefaultResolver.LookupHost(lookupCtx, host)
+		if err != nil {
+			return nil, false
+		}
+		ips = looked
+	}
+	if len(ips) < 2 {
+		return nil, false
+	}
+
+	results := make([]IPCert, len(ips))
+	sem := make(chan struct{}, ipCertConcurrency)
+	var wg sync.WaitGroup
+	for i, ip := range ips {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, ip string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[i] = probeIPCert(ctx, ip, port, sni, timeout)
+		}(i, ip)
+	}
+	wg.Wait()
+
+	differ := ipCertsDiffer(results)
+	return results, differ
+}
+
+// probeIPCert connects to a single resolved address, presenting sni, and
+// retrieves its leaf certificate. Any failure is captured in IPCert.Error.
+func probeIPCert(ctx context.Context, ip, port, sni string, timeout time.Duration) IPCert {
+	res := IPCert{IP: ip}
+	addr := net.JoinHostPort(ip, port)
+
+	conn, err := dialPlaintext(ctx, addr, timeout)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	defer conn.Close()
+
+	tlsConn, err := tlsHandshake(ctx, conn, sni, timeout)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+
+	state := tlsConn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		res.Error = "server presented no certificates"
+		return res
+	}
+
+	now := time.Now()
+	info := certInfo(state.PeerCertificates[0], now)
+	res.FingerprintSHA256 = info.FingerprintSHA256
+	res.SubjectCN = info.SubjectCN
+	res.NotAfter = info.NotAfter
+	res.DaysRemaining = info.DaysRemaining
+	return res
+}
+
+// ipCertsDiffer reports whether the reachable addresses (those without an
+// error) present more than one distinct leaf fingerprint. Unreachable addresses
+// are ignored, so a single transient failure does not flag a difference.
+func ipCertsDiffer(certs []IPCert) bool {
+	var first string
+	seen := false
+	for _, c := range certs {
+		if c.Error != "" || c.FingerprintSHA256 == "" {
+			continue
+		}
+		if !seen {
+			first = c.FingerprintSHA256
+			seen = true
+			continue
+		}
+		if c.FingerprintSHA256 != first {
+			return true
+		}
+	}
+	return false
+}
+
 // parseTarget splits a target into host and port. It strips a leading
 // scheme and any trailing path or query, then splits the host and port.
 // When no port is present, defaultPortOverride (or 443) is used. IPv6
@@ -371,6 +599,9 @@ func certInfo(c *x509.Certificate, now time.Time) CertInfo {
 	return CertInfo{
 		Subject:            c.Subject.String(),
 		Issuer:             c.Issuer.String(),
+		SubjectCN:          c.Subject.CommonName,
+		IssuerCN:           c.Issuer.CommonName,
+		KeyBits:            keyBits(c.PublicKey),
 		SerialNumber:       c.SerialNumber.String(),
 		NotBefore:          c.NotBefore,
 		NotAfter:           c.NotAfter,
@@ -383,6 +614,21 @@ func certInfo(c *x509.Certificate, now time.Time) CertInfo {
 		SignatureAlgorithm: c.SignatureAlgorithm.String(),
 		PublicKeyAlgorithm: c.PublicKeyAlgorithm.String(),
 		FingerprintSHA256:  formatFingerprint(sum[:]),
+	}
+}
+
+// keyBits returns the size of a public key in bits: the modulus length for RSA,
+// the curve size for ECDSA, 256 for Ed25519, and 0 for any unrecognized key.
+func keyBits(pub any) int {
+	switch k := pub.(type) {
+	case *rsa.PublicKey:
+		return k.N.BitLen()
+	case *ecdsa.PublicKey:
+		return k.Curve.Params().BitSize
+	case ed25519.PublicKey:
+		return 256
+	default:
+		return 0
 	}
 }
 

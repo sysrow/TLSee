@@ -5,12 +5,17 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"tlsee/internal/report"
@@ -20,9 +25,12 @@ import (
 // version is the tool's version string, printed by the version subcommand.
 const version = "tlsee 0.1.0"
 
-// errTargetCount is returned when the scan subcommand does not receive
-// exactly one positional target.
-var errTargetCount = errors.New("exactly one target is required")
+// batchConcurrency caps how many hosts are scanned at once in batch mode.
+const batchConcurrency = 16
+
+// errNoTargets is returned when neither positional arguments nor a host file
+// supply any target to scan.
+var errNoTargets = errors.New("at least one target is required")
 
 // Exit codes returned by Run.
 const (
@@ -44,6 +52,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "scan":
 		return runScan(args[1:], stdout, stderr)
+	case "sweep":
+		return runSweep(args[1:], stdout, stderr)
 	case "version":
 		fmt.Fprintln(stdout, version)
 		return exitOK
@@ -59,7 +69,10 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-// runScan handles the "scan" subcommand.
+// runScan handles the "scan" subcommand. It accepts one or more positional
+// targets plus an optional -f/--file list, scanning a single target as a full
+// report and multiple targets (or any --table run) as a concurrent summary
+// table. The exit code is the worst per-host code.
 func runScan(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -73,7 +86,14 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		warnDays  = fs.Int("warn-days", 30, "warn when a certificate expires within this many days")
 		insecure  = fs.Bool("insecure", false, "always exit 0 even when the certificate has problems")
 		noCheck   = fs.Bool("no-check", false, "skip SAN liveness checks (resolve + TCP-probe of each certificate name)")
+		startTLS  = fs.String("starttls", "", "STARTTLS protocol to negotiate first: smtp|imap|pop3|ftp|postgres|ldap")
+		allIPs    = fs.Bool("all-ips", false, "connect to every resolved A/AAAA address and compare certificates")
+		table     = fs.Bool("table", false, "always print the summary table, even for a single target")
+		quiet     = fs.Bool("quiet", false, "print only problems; print nothing when everything is healthy")
+		file      = fs.String("file", "", "read targets from a file (one per line; # comments and blanks ignored)")
 	)
+	fs.StringVar(file, "f", "", "shorthand for --file")
+	fs.BoolVar(quiet, "q", false, "shorthand for --quiet")
 
 	fs.Usage = func() { printScanUsage(stderr, fs) }
 
@@ -86,14 +106,24 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	target, err := parseInterspersed(fs, args)
+	positional, err := parseInterspersed(fs, args)
 	if err != nil {
-		// A flag-parse error was already printed to stderr by the flag
-		// package; the target-count error is ours to report.
-		if errors.Is(err, errTargetCount) {
-			fmt.Fprintln(stderr, "tlsee scan: "+err.Error())
-			fs.Usage()
+		// A flag-parse error was already printed to stderr by the flag package.
+		return exitError
+	}
+
+	targets := positional
+	if *file != "" {
+		fileTargets, err := readHostFile(*file)
+		if err != nil {
+			fmt.Fprintf(stderr, "tlsee scan: %v\n", err)
+			return exitError
 		}
+		targets = append(targets, fileTargets...)
+	}
+	if len(targets) == 0 {
+		fmt.Fprintln(stderr, "tlsee scan: "+errNoTargets.Error())
+		fs.Usage()
 		return exitError
 	}
 
@@ -103,14 +133,36 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		return exitError
 	}
 
-	ctx := context.Background()
-	rep, err := tlsscan.Scan(ctx, target, tlsscan.Options{
+	opts := tlsscan.Options{
 		Port:       *port,
 		Timeout:    *timeout,
 		ServerName: *sni,
 		ResolveDNS: true,
 		CheckSANs:  !*noCheck,
-	})
+		StartTLS:   *startTLS,
+		AllIPs:     *allIPs,
+	}
+
+	// Wire the root context to interrupt signals so Ctrl-C (SIGINT) or SIGTERM
+	// cancels in-flight dials and handshakes cooperatively instead of
+	// hard-killing the process. The context is already threaded down into Scan
+	// and every dial/handshake/probe, so cancellation unwinds a run cleanly.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// A single target with neither --table nor --quiet keeps the original
+	// full-report behavior.
+	if len(targets) == 1 && !*table && !*quiet {
+		return scanSingle(ctx, stdout, stderr, targets[0], opts, *warnDays, *asJSON, useColor, *insecure)
+	}
+
+	return scanBatch(ctx, stdout, stderr, targets, opts, *warnDays, *asJSON, useColor, *quiet, *insecure)
+}
+
+// scanSingle scans one target and renders the full report. It returns the
+// per-report exit code, or exitOK under --insecure.
+func scanSingle(ctx context.Context, stdout, stderr io.Writer, target string, opts tlsscan.Options, warnDays int, asJSON, useColor, insecure bool) int {
+	rep, err := tlsscan.Scan(ctx, target, opts)
 	if err != nil {
 		fmt.Fprintf(stderr, "tlsee scan: %v\n", err)
 		return exitError
@@ -118,9 +170,9 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 
 	// The configurable warn-days threshold is carried on the report so
 	// rendering and exit-code logic share one source of truth.
-	rep.WarnDays = *warnDays
+	rep.WarnDays = warnDays
 
-	if *asJSON {
+	if asJSON {
 		if err := report.WriteJSON(stdout, rep); err != nil {
 			fmt.Fprintf(stderr, "tlsee scan: %v\n", err)
 			return exitError
@@ -129,39 +181,248 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 		report.WriteText(stdout, rep, useColor)
 	}
 
-	if *insecure {
+	if insecure {
 		return exitOK
 	}
 	return exitCodeForReport(rep)
 }
 
-// parseInterspersed parses fs from args while allowing the single positional
-// target to appear before, after, or among the flags. The stdlib flag package
-// stops at the first non-flag argument, so Parse is re-invoked on the arguments
-// that follow each positional until every flag is consumed. It returns the one
-// target, or errTargetCount if there is not exactly one.
-func parseInterspersed(fs *flag.FlagSet, args []string) (string, error) {
-	var target string
-	seen := false
+// scanBatch scans every target concurrently (bounded) and renders a summary
+// table or JSON array. The returned exit code is the worst per-host code:
+// exitCertProb if any certificate is unhealthy, exitError if any scan failed,
+// else exitOK. When quiet is set healthy rows are omitted from output, but the
+// exit code still reflects all hosts.
+//
+// Under --insecure only certificate problems are suppressed, never connection
+// failures: this mirrors scanSingle, where a scan that fails to connect returns
+// exitError regardless of --insecure. A blanket exitOK here would silently mask
+// a down host in batch mode (a cron monitor would lose the down-host signal),
+// so any host that failed to scan still yields exitError.
+func scanBatch(ctx context.Context, stdout, stderr io.Writer, targets []string, opts tlsscan.Options, warnDays int, asJSON, useColor, quiet, insecure bool) int {
+	rows := scanTargets(ctx, targets, opts, warnDays)
+
+	if asJSON {
+		if err := report.WriteBatchJSON(stdout, rows, quiet); err != nil {
+			fmt.Fprintf(stderr, "tlsee scan: %v\n", err)
+			return exitError
+		}
+	} else {
+		report.WriteBatchTable(stdout, rows, useColor, quiet)
+	}
+
+	if insecure {
+		for _, row := range rows {
+			if row.Err != "" {
+				return exitError
+			}
+		}
+		return exitOK
+	}
+	return worstExitCode(rows)
+}
+
+// scanTargets scans each target concurrently with a bounded worker pool,
+// preserving input order in the returned rows. A scan error is recorded as the
+// row's Err; a successful scan carries its report with WarnDays applied.
+func scanTargets(ctx context.Context, targets []string, opts tlsscan.Options, warnDays int) []report.BatchRow {
+	rows := make([]report.BatchRow, len(targets))
+	sem := make(chan struct{}, batchConcurrency)
+	var wg sync.WaitGroup
+	for i, target := range targets {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, target string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			rep, err := tlsscan.Scan(ctx, target, opts)
+			if err != nil {
+				rows[i] = report.BatchRow{Host: target, Err: err.Error()}
+				return
+			}
+			rep.WarnDays = warnDays
+			rows[i] = report.BatchRow{Host: target, Report: rep}
+		}(i, target)
+	}
+	wg.Wait()
+	return rows
+}
+
+// worstExitCode returns the most severe exit code across all batch rows: a
+// scan failure contributes exitError and a certificate problem exitCertProb.
+// exitCertProb outranks exitError because a present-but-broken certificate is
+// the more actionable finding for a monitoring run.
+func worstExitCode(rows []report.BatchRow) int {
+	worst := exitOK
+	for _, row := range rows {
+		code := exitOK
+		if row.Err != "" {
+			code = exitError
+		} else {
+			code = exitCodeForReport(row.Report)
+		}
+		if code > worst {
+			worst = code
+		}
+	}
+	return worst
+}
+
+// parseInterspersed parses fs from args while allowing positional targets to
+// appear before, after, or among the flags. The stdlib flag package stops at
+// the first non-flag argument, so Parse is re-invoked on the arguments that
+// follow each positional until every flag is consumed. It returns all
+// positional targets in the order they appeared (possibly none, since targets
+// may instead come from a host file).
+//
+// A "--" end-of-flags terminator is honored once, at the top level: everything
+// after the first "--" is treated as positional verbatim and never re-parsed as
+// flags. The stdlib flag package only honors "--" within a single Parse call,
+// so without this the terminator would lose effect on the loop's later
+// iterations. Splitting here keeps standard Unix flag semantics for both the
+// scan and sweep subcommands, which share this function.
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 	rest := args
+	var trailing []string
+	for i, a := range args {
+		if a == "--" {
+			rest = args[:i]
+			trailing = args[i+1:]
+			break
+		}
+	}
+
+	var targets []string
 	for {
 		if err := fs.Parse(rest); err != nil {
-			return "", err
+			return nil, err
 		}
 		if fs.NArg() == 0 {
 			break
 		}
-		if seen {
-			return "", errTargetCount
-		}
-		target = fs.Arg(0)
-		seen = true
+		targets = append(targets, fs.Arg(0))
 		rest = fs.Args()[1:]
 	}
-	if !seen {
-		return "", errTargetCount
+	targets = append(targets, trailing...)
+	return targets, nil
+}
+
+// readHostFile opens path and parses its target lines. It wraps the open error
+// so the caller reports a clear message; parsing itself is delegated to
+// parseHostList so it can be tested without disk.
+func readHostFile(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read host file: %w", err)
 	}
-	return target, nil
+	defer f.Close()
+	return parseHostList(f), nil
+}
+
+// parseHostList reads one target per line from r, trimming surrounding
+// whitespace and skipping blank lines and lines whose first non-blank character
+// is '#'. It takes an io.Reader so tests can supply an in-memory source.
+func parseHostList(r io.Reader) []string {
+	var targets []string
+	sc := bufio.NewScanner(r)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		targets = append(targets, line)
+	}
+	return targets
+}
+
+// runSweep handles the "sweep" subcommand: probe many ports of a single host
+// and print a table of which ports speak TLS and the certificate each presents.
+func runSweep(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("sweep", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	var (
+		ports     = fs.String("ports", "", "ports to scan: comma list and/or ranges, e.g. 443,8443,9000-9100 (default: curated list)")
+		full      = fs.Bool("full", false, "scan all ports 1-65535 (slow)")
+		timeout   = fs.Duration("timeout", 3*time.Second, "per-port probe timeout")
+		asJSON    = fs.Bool("json", false, "emit JSON instead of text")
+		colorMode = fs.String("color", "auto", "color output: auto|always|never")
+	)
+
+	fs.Usage = func() { printSweepUsage(stderr, fs) }
+
+	for _, a := range args {
+		if a == "-h" || a == "--help" {
+			printSweepUsage(stdout, fs)
+			return exitOK
+		}
+	}
+
+	hosts, err := parseInterspersed(fs, args)
+	if err != nil {
+		return exitError
+	}
+	if len(hosts) != 1 {
+		fmt.Fprintln(stderr, "tlsee sweep: exactly one host is required")
+		fs.Usage()
+		return exitError
+	}
+	host := hosts[0]
+
+	if *ports != "" && *full {
+		fmt.Fprintln(stderr, "tlsee sweep: --ports and --full are mutually exclusive")
+		return exitError
+	}
+
+	useColor, err := resolveColor(*colorMode, stdout)
+	if err != nil {
+		fmt.Fprintf(stderr, "tlsee sweep: %v\n", err)
+		return exitError
+	}
+
+	opts := tlsscan.SweepOptions{Timeout: *timeout}
+	switch {
+	case *full:
+		opts.Ports = fullPortRange()
+		opts.Concurrency = 256
+	case *ports != "":
+		list, err := tlsscan.ParsePortSpec(*ports)
+		if err != nil {
+			fmt.Fprintf(stderr, "tlsee sweep: %v\n", err)
+			return exitError
+		}
+		opts.Ports = list
+	}
+
+	// Wire the root context to interrupt signals so an interrupt during a long
+	// sweep (up to 65535 ports under --full) cancels in-flight probes
+	// cooperatively rather than hard-killing the process mid-handshake.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	sr, err := tlsscan.Sweep(ctx, host, opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "tlsee sweep: %v\n", err)
+		return exitError
+	}
+
+	if *asJSON {
+		if err := report.WriteSweepJSON(stdout, sr); err != nil {
+			fmt.Fprintf(stderr, "tlsee sweep: %v\n", err)
+			return exitError
+		}
+	} else {
+		report.WriteSweepText(stdout, sr, useColor)
+	}
+	return exitOK
+}
+
+// fullPortRange returns every port 1-65535 for a --full sweep.
+func fullPortRange() []int {
+	ports := make([]int, 0, 65535)
+	for p := 1; p <= 65535; p++ {
+		ports = append(ports, p)
+	}
+	return ports
 }
 
 // exitCodeForReport returns exitCertProb when the certificate is unhealthy
@@ -215,7 +476,22 @@ func isTerminal(w io.Writer) bool {
 
 // printScanUsage writes the scan subcommand usage and flag list to w.
 func printScanUsage(w io.Writer, fs *flag.FlagSet) {
-	fmt.Fprintln(w, "Usage: tlsee scan <target> [flags]")
+	fmt.Fprintln(w, "Usage: tlsee scan <target>... [flags]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "One or more targets, and/or -f/--file with one target per line.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Flags:")
+	fs.SetOutput(w)
+	fs.PrintDefaults()
+}
+
+// printSweepUsage writes the sweep subcommand usage and flag list to w.
+func printSweepUsage(w io.Writer, fs *flag.FlagSet) {
+	fmt.Fprintln(w, "Usage: tlsee sweep <host> [flags]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Probe many ports of one host for TLS and report each certificate.")
+	fmt.Fprintln(w, "By default a curated list of well-known TLS and STARTTLS ports is scanned.")
+	fmt.Fprintln(w, "--full scans all 65535 ports and is slow.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Flags:")
 	fs.SetOutput(w)
@@ -227,9 +503,10 @@ func writeUsage(w io.Writer) {
 	fmt.Fprint(w, `tlsee - a friendly TLS certificate inspector
 
 Usage:
-  tlsee scan <target> [flags]   Inspect the TLS certificate at a target
-  tlsee version                 Print the tlsee version
-  tlsee help                    Show this help
+  tlsee scan <target>... [flags]   Inspect the TLS certificate(s) at one or more targets
+  tlsee sweep <host> [flags]       Probe many ports of a host for TLS certificates
+  tlsee version                    Print the tlsee version
+  tlsee help                       Show this help
 
 Targets may be a hostname, host:port, IP, or URL. Examples:
   tlsee scan example.com
@@ -237,16 +514,45 @@ Targets may be a hostname, host:port, IP, or URL. Examples:
   tlsee scan localhost:8443
   tlsee scan 127.0.0.1:8443
   tlsee scan [::1]:8443
+  tlsee scan -f hosts.txt -q
+  tlsee scan a.example.com b.example.com --table
+  tlsee scan smtp.example.com --port 587 --starttls smtp
+  tlsee sweep example.com
+  tlsee sweep example.com --ports 443,8443,9000-9100
 
 Scan flags:
   --port N            port to use when the target omits one (default 443)
   --timeout 10s       dial and handshake timeout (default 10s)
   --sni name          SNI server name override (default: target host)
+  --starttls PROTO    negotiate STARTTLS first: smtp|imap|pop3|ftp|postgres|ldap
+  --all-ips           connect to every resolved address and compare certificates
   --json              emit JSON instead of text
   --color MODE        auto|always|never (default auto)
   --warn-days N       warn when expiring within N days (default 30)
   --no-check          skip SAN liveness checks (on by default)
+  --table             always print the summary table, even for one target
+  -q, --quiet         print only problems; print nothing when all healthy
+  -f, --file PATH     read targets from a file (one per line; # comments ignored)
   --insecure          always exit 0 even when the certificate has problems
+
+With more than one target, or with --table, tlsee scans every target
+concurrently and prints a summary table (HOST, DAYS, STATUS, NOTE), sorted by
+urgency. --quiet prints only problem rows (a clean cron check); when used with
+a single target it prints nothing for a healthy certificate. The exit code is
+the worst per-host code.
+
+Note: --quiet routes even a single target through the batch path, so
+"scan host --quiet --json" emits a JSON array (one element for an unhealthy
+host, empty/silent when healthy), whereas "scan host --json" without --quiet
+emits a single JSON object. Scripts that parse single-host JSON should account
+for this shape difference.
+
+Sweep flags:
+  --ports SPEC        comma list and/or ranges, e.g. 443,8443,9000-9100
+  --full              scan all ports 1-65535 (slow)
+  --timeout 3s        per-port probe timeout (default 3s)
+  --json              emit JSON instead of text
+  --color MODE        auto|always|never (default auto)
 
 By default tlsee also resolves and TCP-probes every DNS name in the
 certificate's SAN list and reports dead or stale entries (a name that no
@@ -262,5 +568,8 @@ Exit codes:
   2  usage shown for no arguments, or a certificate problem: expired, not
      yet valid, untrusted, hostname mismatch, or expiring within --warn-days
      (a certificate problem is suppressed by --insecure)
+
+In batch mode the exit code is the worst per-host code: 2 if any certificate
+has a problem, 1 if any host failed to scan, else 0.
 `)
 }

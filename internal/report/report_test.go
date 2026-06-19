@@ -233,13 +233,19 @@ func TestWriteTextSANLivenessColor(t *testing.T) {
 	}
 }
 
-// TestSummarizeDeadSANs verifies a dead SAN turns an otherwise-valid status
-// red and is reported, while a wildcard-only report stays VALID.
+// TestSummarizeDeadSANs verifies a dead SAN on an otherwise-valid certificate
+// is a non-red advisory: the headline still reads VALID (so the healthy
+// indicator survives and the exit-code/quiet contract is respected) and is not
+// colored red, while the dead SAN is still reported. A wildcard-only report
+// stays plain VALID.
 func TestSummarizeDeadSANs(t *testing.T) {
 	r := reportWithSANChecks()
 	st := summarize(r)
-	if st.color != colorRed {
-		t.Errorf("dead-SAN status color = %q; want red %q", st.color, colorRed)
+	if st.color == colorRed {
+		t.Errorf("dead-SAN-only status color = %q; want non-red (cert is valid)", st.color)
+	}
+	if !strings.Contains(st.text, "VALID") {
+		t.Errorf("status = %q; want it to retain the VALID indicator", st.text)
 	}
 	if !strings.Contains(st.text, "1 DEAD SAN") {
 		t.Errorf("status = %q; want it to mention the dead SAN", st.text)

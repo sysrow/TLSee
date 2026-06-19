@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"text/tabwriter"
 
@@ -25,6 +26,11 @@ const (
 	colorBold   = "\033[1m"
 )
 
+// sweepWarnDays is the days-remaining threshold below which a sweep reports a
+// certificate as expiring. The sweep subcommand has no --warn-days flag, so this
+// matches the scan default for consistency.
+const sweepWarnDays = 30
+
 // status describes the overall health summary of a report.
 type status struct {
 	text  string
@@ -34,6 +40,13 @@ type status struct {
 // summarize combines the report's conditions into a single prominent
 // status. The most severe problem wins; an otherwise healthy certificate
 // that is expiring within WarnDays is reported as expiring soon.
+//
+// Dead SANs are a non-red advisory, not a certificate problem: they do not
+// change the exit code and a dead-SAN-only certificate stays "healthy" for
+// --quiet, so they must neither erase the healthy VALID indicator nor turn
+// the headline red. When the certificate is otherwise valid, the headline
+// reads "VALID | N DEAD SAN(S)" in yellow; when there is already a real
+// problem, the dead-SAN advisory is appended without escalating the color.
 func summarize(r *tlsscan.Report) status {
 	var problems []string
 	worst := colorYellow
@@ -57,13 +70,21 @@ func summarize(r *tlsscan.Report) status {
 	if !r.Leaf.Expired && !r.Leaf.NotYetValid && r.Leaf.DaysRemaining <= r.WarnDays {
 		problems = append(problems, expiringStatus(r.Leaf.DaysRemaining))
 	}
-	if r.DeadSANs > 0 {
-		problems = append(problems, deadSANStatus(r.DeadSANs))
-		worst = colorRed
+
+	// If nothing above flagged a real certificate problem, the certificate is
+	// healthy. A dead-SAN advisory is then appended to the VALID headline as a
+	// non-red note rather than replacing it.
+	if len(problems) == 0 {
+		if r.DeadSANs > 0 {
+			return status{text: "VALID | " + deadSANStatus(r.DeadSANs), color: colorYellow}
+		}
+		return status{text: "VALID", color: colorGreen}
 	}
 
-	if len(problems) == 0 {
-		return status{text: "VALID", color: colorGreen}
+	// A real problem exists. Append the dead-SAN advisory for visibility, but do
+	// not let it escalate the color beyond what the real problems already set.
+	if r.DeadSANs > 0 {
+		problems = append(problems, deadSANStatus(r.DeadSANs))
 	}
 	return status{text: strings.Join(problems, " | "), color: worst}
 }
@@ -151,6 +172,14 @@ func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
 
 	tw.Flush()
 
+	if len(r.Warnings) > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "  Warnings:")
+		for _, warning := range r.Warnings {
+			fmt.Fprintf(w, "    %s\n", paint(warning, colorYellow, color))
+		}
+	}
+
 	if len(r.SANChecks) > 0 {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "  SAN liveness:")
@@ -162,15 +191,74 @@ func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
 		stw.Flush()
 	}
 
+	if len(r.IPCerts) > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "  Per-IP certificates:")
+		if r.IPCertsDiffer {
+			fmt.Fprintf(w, "    %s\n", paint("certificates differ across IPs", colorRed+colorBold, color))
+		}
+		itw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+		for _, ic := range r.IPCerts {
+			if ic.Error != "" {
+				fmt.Fprintf(itw, "    %s\t%s\n", ic.IP, paint(ic.Error, colorRed, color))
+				continue
+			}
+			cn := ic.SubjectCN
+			if cn == "" {
+				cn = "(no CN)"
+			}
+			// When the certificates differ across IPs, append a short fingerprint
+			// prefix so otherwise-identical rows (same CN, same expiry) are visibly
+			// distinct and the reader can see which address serves which cert. The
+			// matching case stays narrow with no fingerprint column.
+			if r.IPCertsDiffer {
+				fmt.Fprintf(itw, "    %s\t%s\t%s\t%s\n", ic.IP, cn, daysPhrase(ic.DaysRemaining), shortFingerprint(ic.FingerprintSHA256))
+				continue
+			}
+			fmt.Fprintf(itw, "    %s\t%s\t%s\n", ic.IP, cn, daysPhrase(ic.DaysRemaining))
+		}
+		itw.Flush()
+	}
+
 	if len(r.Chain) > 0 {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "  Chain:")
-		ctw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
 		for i, c := range r.Chain {
-			fmt.Fprintf(ctw, "    [%d]\t%s\t(issuer: %s)\n", i+1, c.Subject, c.Issuer)
+			subject := certName(c.SubjectCN, c.Subject)
+			issuer := certName(c.IssuerCN, c.Issuer)
+			fmt.Fprintf(w, "    [%d]  %s  ->  %s\n", i+1, subject, issuer)
 		}
-		ctw.Flush()
 	}
+}
+
+// certName returns the common name when present, falling back to the full
+// distinguished name. It keeps the text chain narrow (one short line per cert)
+// while the full DN remains available in JSON.
+func certName(cn, full string) string {
+	if cn != "" {
+		return cn
+	}
+	if full != "" {
+		return full
+	}
+	return "(unknown)"
+}
+
+// shortFingerprint returns a brief, human-comparable prefix of a colon-separated
+// SHA-256 fingerprint for use as a per-IP discriminator. It keeps the first eight
+// hex byte groups (for example "AA:BB:CC:DD:EE:FF:00:11") so differing
+// certificates render as visibly distinct rows without printing the full 32-byte
+// digest. An empty fingerprint yields "?".
+func shortFingerprint(fp string) string {
+	if fp == "" {
+		return "?"
+	}
+	const groups = 8
+	parts := strings.SplitN(fp, ":", groups+1)
+	if len(parts) > groups {
+		return strings.Join(parts[:groups], ":") + ":..."
+	}
+	return fp
 }
 
 // WriteJSON renders the report as indented JSON. Color is never applied.
@@ -179,6 +267,211 @@ func WriteJSON(w io.Writer, r *tlsscan.Report) error {
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(r); err != nil {
 		return fmt.Errorf("encode report: %w", err)
+	}
+	return nil
+}
+
+// BatchRow pairs a target host with either its scan report or the error that
+// scanning it produced. Exactly one of Report and Err is meaningful: when Err is
+// non-empty the scan failed and Report is nil. It is the unit of the batch
+// summary table and the batch JSON array.
+type BatchRow struct {
+	Host   string
+	Report *tlsscan.Report
+	Err    string
+}
+
+// batchStatus is the per-row status word, day count, dead-SAN count, and color
+// derived from a BatchRow for the summary table.
+type batchStatus struct {
+	status string
+	days   string
+	dead   string
+	color  string
+}
+
+// rowStatus reduces a BatchRow to its display fields. Errors sort and render
+// first; otherwise the most severe certificate problem wins, mirroring
+// summarize but as compact one-word column values.
+func rowStatus(row BatchRow) batchStatus {
+	if row.Err != "" {
+		return batchStatus{status: "ERROR", days: "ERR", dead: "-", color: colorRed}
+	}
+	r := row.Report
+	dead := fmt.Sprintf("%d", r.DeadSANs)
+	days := fmt.Sprintf("%d", r.Leaf.DaysRemaining)
+	switch {
+	case r.Leaf.Expired, r.Leaf.NotYetValid:
+		return batchStatus{status: "EXPIRED", days: days, dead: dead, color: colorRed}
+	case !r.ChainTrusted:
+		return batchStatus{status: "UNTRUSTED", days: days, dead: dead, color: colorRed}
+	case !r.HostnameMatch:
+		return batchStatus{status: "MISMATCH", days: days, dead: dead, color: colorRed}
+	case r.Leaf.DaysRemaining <= r.WarnDays:
+		return batchStatus{status: "EXPIRING", days: days, dead: dead, color: colorYellow}
+	default:
+		return batchStatus{status: "VALID", days: days, dead: dead, color: colorGreen}
+	}
+}
+
+// batchSortKey orders rows for the summary table: most urgent first. Errored
+// rows sort to the very top; among scanned rows, fewer days remaining sorts
+// earlier. Ties break by host name for stable, deterministic output.
+func batchSortKey(rows []BatchRow) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		ei, ej := rows[i].Err != "", rows[j].Err != ""
+		if ei != ej {
+			return ei // errors first
+		}
+		if ei && ej {
+			return rows[i].Host < rows[j].Host
+		}
+		di, dj := rows[i].Report.Leaf.DaysRemaining, rows[j].Report.Leaf.DaysRemaining
+		if di != dj {
+			return di < dj
+		}
+		return rows[i].Host < rows[j].Host
+	})
+}
+
+// WriteBatchTable renders one row per host as an aligned summary table sorted by
+// urgency (errored hosts first, then fewest days remaining). When quiet is true,
+// healthy rows are omitted; if every row is healthy nothing is written. The
+// passed slice is sorted in place.
+func WriteBatchTable(w io.Writer, rows []BatchRow, color, quiet bool) {
+	batchSortKey(rows)
+
+	visible := rows
+	if quiet {
+		visible = visible[:0:0]
+		for _, row := range rows {
+			if rowIsHealthy(row) {
+				continue
+			}
+			visible = append(visible, row)
+		}
+		if len(visible) == 0 {
+			return
+		}
+	}
+
+	// The last column is labeled NOTE rather than DEAD: it honestly covers both
+	// the dead-SAN count on a successful row and the free-text scan error on a
+	// failed row, instead of putting an error message under a "dead SAN count"
+	// header.
+	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "HOST\tDAYS\tSTATUS\tNOTE")
+	for _, row := range visible {
+		bs := rowStatus(row)
+		status := paint(bs.status, bs.color, color)
+		note := bs.dead
+		if row.Err != "" {
+			note = row.Err
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", row.Host, bs.days, status, note)
+	}
+	tw.Flush()
+}
+
+// rowIsHealthy reports whether a batch row needs no attention: a successful scan
+// of a certificate that is trusted, hostname-matching, currently valid, and not
+// within its warn window. It mirrors the cli exit-code health predicate so quiet
+// mode hides exactly the rows that would not change the exit code. Dead SANs do
+// not make a row unhealthy here, matching the exit-code contract.
+func rowIsHealthy(row BatchRow) bool {
+	if row.Err != "" {
+		return false
+	}
+	r := row.Report
+	return r.ChainTrusted &&
+		r.HostnameMatch &&
+		!r.Leaf.Expired &&
+		!r.Leaf.NotYetValid &&
+		r.Leaf.DaysRemaining > r.WarnDays
+}
+
+// WriteBatchJSON renders the batch as a JSON array. Each healthy or unhealthy
+// scan is emitted as its full report; each failed scan is emitted as a
+// {host, error} object. When quiet is true, healthy rows are omitted and, if
+// nothing remains, nothing is written at all (so quiet JSON stays silent for an
+// all-healthy run, matching the text path). The passed slice is sorted in place
+// to match the table ordering.
+func WriteBatchJSON(w io.Writer, rows []BatchRow, quiet bool) error {
+	batchSortKey(rows)
+
+	type failure struct {
+		Host  string `json:"host"`
+		Error string `json:"error"`
+	}
+
+	items := make([]any, 0, len(rows))
+	for _, row := range rows {
+		if quiet && rowIsHealthy(row) {
+			continue
+		}
+		if row.Err != "" {
+			items = append(items, failure{Host: row.Host, Error: row.Err})
+			continue
+		}
+		items = append(items, row.Report)
+	}
+
+	// In quiet mode, an empty result means every host was healthy: stay silent
+	// rather than emitting an empty array, so a clean run produces no output.
+	if quiet && len(items) == 0 {
+		return nil
+	}
+
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(items); err != nil {
+		return fmt.Errorf("encode batch: %w", err)
+	}
+	return nil
+}
+
+// WriteSweepText renders a port sweep as a table sorted by port. Closed ports
+// and ports without TLS are reported alongside the certificates found. The CERT
+// column shows the leaf subject common name; the STATUS column summarizes
+// validity (VALID, EXPIRING Nd, EXPIRED, no TLS, or closed).
+func WriteSweepText(w io.Writer, sr *tlsscan.SweepResult, color bool) {
+	fmt.Fprintf(w, "%s %s\n\n", paint("tlsee sweep", colorBold, color), sr.Host)
+
+	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(tw, "PORT\tPROTO\tCERT\tSTATUS")
+	for _, p := range sr.Ports {
+		status, stColor := sweepStatus(p)
+		cert := p.SubjectCN
+		if cert == "" {
+			cert = "-"
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\n", p.Port, p.Proto, cert, paint(status, stColor, color))
+	}
+	tw.Flush()
+}
+
+// sweepStatus maps a port probe result to its STATUS column word and color.
+func sweepStatus(p tlsscan.PortResult) (string, string) {
+	switch {
+	case !p.Open:
+		return "closed", ""
+	case !p.TLS:
+		return "no TLS", colorYellow
+	case p.Expired:
+		return "EXPIRED", colorRed
+	case p.DaysRemaining <= sweepWarnDays:
+		return fmt.Sprintf("EXPIRING %dd", p.DaysRemaining), colorYellow
+	default:
+		return "VALID", colorGreen
+	}
+}
+
+// WriteSweepJSON renders a sweep result as indented JSON.
+func WriteSweepJSON(w io.Writer, sr *tlsscan.SweepResult) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(sr); err != nil {
+		return fmt.Errorf("encode sweep: %w", err)
 	}
 	return nil
 }

@@ -1,0 +1,7 @@
+# Compiled binary
+/tlsee
+
+# Test and coverage artifacts
+*.test
+*.out
+coverage.*

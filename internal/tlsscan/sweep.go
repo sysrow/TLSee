@@ -93,8 +93,16 @@ func Sweep(ctx context.Context, host string, opts SweepOptions) (*SweepResult, e
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for i, port := range ports {
+		// Stop dispatching promptly on cancellation (Ctrl-C/SIGTERM) rather than
+		// launching a probe for every remaining port (important for --full).
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			sort.Slice(results, func(a, b int) bool { return results[a].Port < results[b].Port })
+			return &SweepResult{Host: host, Ports: results}, nil
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(i, port int) {
 			defer wg.Done()
 			defer func() { <-sem }()
@@ -155,7 +163,8 @@ func probePort(ctx context.Context, host string, port int, proto string, timeout
 	now := time.Now()
 	info := certInfo(state.PeerCertificates[0], now)
 	res.SubjectCN = info.SubjectCN
-	res.NotAfter = info.NotAfter
+	notAfter := info.NotAfter
+	res.NotAfter = &notAfter
 	res.DaysRemaining = info.DaysRemaining
 	res.Expired = info.Expired
 	return res

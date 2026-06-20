@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"unicode"
 
 	"tlsee/internal/tlsscan"
 )
@@ -97,6 +98,47 @@ func deadSANStatus(n int) string {
 	return fmt.Sprintf("%d DEAD SANS", n)
 }
 
+// sanitize strips control characters from untrusted, certificate- or
+// target-derived strings before they are printed to a terminal. Certificate
+// subjects, issuers, SAN names, verify errors, and target hosts are all
+// attacker-influenced; a malicious server could embed ANSI escape sequences
+// (ESC, 0x1b) or other C0/C1 control bytes to forge or corrupt the terminal
+// output (clearing the screen, overwriting earlier lines, hiding text).
+//
+// It iterates runes (not bytes) so legitimate multibyte UTF-8 in a subject or
+// SAN is preserved intact, and drops any control rune except the horizontal
+// tab, which tabwriter relies on for column layout. This covers C0, DEL, the
+// C1 range, and ESC. It is applied only on the text and table paths; the JSON
+// paths are left untouched because encoding/json already escapes control
+// characters.
+func sanitize(s string) string {
+	if !strings.ContainsFunc(s, func(r rune) bool {
+		return r != '\t' && unicode.IsControl(r)
+	}) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r == '\t' || !unicode.IsControl(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// sanitizeJoin sanitizes each element of parts and joins them with sep. It is
+// used for lists of untrusted names (SAN DNS names, SAN IP addresses) so a
+// control character in any single element cannot survive into the rendered
+// line.
+func sanitizeJoin(parts []string, sep string) string {
+	cleaned := make([]string, len(parts))
+	for i, p := range parts {
+		cleaned[i] = sanitize(p)
+	}
+	return strings.Join(cleaned, sep)
+}
+
 // paint wraps s in an ANSI color when enabled, otherwise returns it
 // unchanged.
 func paint(s, color string, enabled bool) string {
@@ -115,6 +157,7 @@ func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
 	if target == "" {
 		target = r.Host
 	}
+	target = sanitize(target)
 
 	fmt.Fprintf(w, "%s %s\n", paint("tlsee", colorBold, color), target)
 	fmt.Fprintf(w, "Status: %s\n", paint(st.text, st.color+colorBold, color))
@@ -131,14 +174,14 @@ func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
 	if len(sans) == 0 {
 		row("SAN DNS", paint("(none)", colorYellow, color))
 	} else {
-		row("SAN DNS", strings.Join(sans, ", "))
+		row("SAN DNS", sanitizeJoin(sans, ", "))
 	}
 	if len(r.Leaf.IPAddresses) > 0 {
-		row("SAN IPs", strings.Join(r.Leaf.IPAddresses, ", "))
+		row("SAN IPs", sanitizeJoin(r.Leaf.IPAddresses, ", "))
 	}
 
-	row("Subject", r.Leaf.Subject)
-	row("Issuer", r.Leaf.Issuer)
+	row("Subject", sanitize(r.Leaf.Subject))
+	row("Issuer", sanitize(r.Leaf.Issuer))
 	row("Serial", r.Leaf.SerialNumber)
 
 	row("Not before", r.Leaf.NotBefore.Format("2006-01-02 15:04:05 MST"))
@@ -148,7 +191,7 @@ func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
 
 	row("Trusted chain", boolText(r.ChainTrusted, color))
 	if r.VerifyError != "" {
-		row("Trust error", paint(r.VerifyError, colorRed, color))
+		row("Trust error", paint(sanitize(r.VerifyError), colorRed, color))
 	}
 	row("Hostname match", boolText(r.HostnameMatch, color))
 
@@ -186,7 +229,7 @@ func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
 		stw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
 		for _, c := range r.SANChecks {
 			addrs, state, stColor := sanLiveness(c)
-			fmt.Fprintf(stw, "    %s\t%s\t%s\n", c.Name, addrs, paint(state, stColor, color))
+			fmt.Fprintf(stw, "    %s\t%s\t%s\n", sanitize(c.Name), addrs, paint(state, stColor, color))
 		}
 		stw.Flush()
 	}
@@ -199,11 +242,12 @@ func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
 		}
 		itw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
 		for _, ic := range r.IPCerts {
+			ipText := sanitize(ic.IP)
 			if ic.Error != "" {
-				fmt.Fprintf(itw, "    %s\t%s\n", ic.IP, paint(ic.Error, colorRed, color))
+				fmt.Fprintf(itw, "    %s\t%s\n", ipText, paint(sanitize(ic.Error), colorRed, color))
 				continue
 			}
-			cn := ic.SubjectCN
+			cn := sanitize(ic.SubjectCN)
 			if cn == "" {
 				cn = "(no CN)"
 			}
@@ -212,10 +256,10 @@ func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
 			// distinct and the reader can see which address serves which cert. The
 			// matching case stays narrow with no fingerprint column.
 			if r.IPCertsDiffer {
-				fmt.Fprintf(itw, "    %s\t%s\t%s\t%s\n", ic.IP, cn, daysPhrase(ic.DaysRemaining), shortFingerprint(ic.FingerprintSHA256))
+				fmt.Fprintf(itw, "    %s\t%s\t%s\t%s\n", ipText, cn, daysPhrase(ic.DaysRemaining), shortFingerprint(ic.FingerprintSHA256))
 				continue
 			}
-			fmt.Fprintf(itw, "    %s\t%s\t%s\n", ic.IP, cn, daysPhrase(ic.DaysRemaining))
+			fmt.Fprintf(itw, "    %s\t%s\t%s\n", ipText, cn, daysPhrase(ic.DaysRemaining))
 		}
 		itw.Flush()
 	}
@@ -233,13 +277,14 @@ func WriteText(w io.Writer, r *tlsscan.Report, color bool) {
 
 // certName returns the common name when present, falling back to the full
 // distinguished name. It keeps the text chain narrow (one short line per cert)
-// while the full DN remains available in JSON.
+// while the full DN remains available in JSON. Both inputs are
+// certificate-derived and therefore sanitized before display.
 func certName(cn, full string) string {
 	if cn != "" {
-		return cn
+		return sanitize(cn)
 	}
 	if full != "" {
-		return full
+		return sanitize(full)
 	}
 	return "(unknown)"
 }
@@ -359,18 +404,73 @@ func WriteBatchTable(w io.Writer, rows []BatchRow, color, quiet bool) {
 	// the dead-SAN count on a successful row and the free-text scan error on a
 	// failed row, instead of putting an error message under a "dead SAN count"
 	// header.
-	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+	//
+	// Column layout is computed on the uncolored cells: tabwriter measures byte
+	// width, so a colored STATUS cell would make it count the invisible ANSI
+	// escape bytes and push the NOTE header out of alignment. The table is laid
+	// out monochrome into a buffer first, then the STATUS word on each data line
+	// is wrapped in color afterwards (color codes have zero visible width, so the
+	// alignment already computed still holds).
+	var plain strings.Builder
+	tw := tabwriter.NewWriter(&plain, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(tw, "HOST\tDAYS\tSTATUS\tNOTE")
-	for _, row := range visible {
+	statuses := make([]batchStatus, len(visible))
+	for i, row := range visible {
 		bs := rowStatus(row)
-		status := paint(bs.status, bs.color, color)
+		statuses[i] = bs
 		note := bs.dead
 		if row.Err != "" {
-			note = row.Err
+			note = sanitize(row.Err)
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", row.Host, bs.days, status, note)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", sanitize(row.Host), bs.days, bs.status, note)
 	}
 	tw.Flush()
+
+	if !color {
+		io.WriteString(w, plain.String())
+		return
+	}
+
+	// Colorize the laid-out table line by line. The header is line 0; each
+	// subsequent line maps in order to statuses[i]. Only the first run of the
+	// already-padded status word is recolored, so a status token appearing inside
+	// a host or note cell is never touched.
+	lines := strings.SplitAfter(plain.String(), "\n")
+	for i, line := range lines {
+		if i == 0 || i-1 >= len(statuses) || line == "" {
+			io.WriteString(w, line)
+			continue
+		}
+		bs := statuses[i-1]
+		io.WriteString(w, colorizeStatusCell(line, bs.status, bs.color))
+	}
+}
+
+// colorizeStatusCell wraps the first occurrence of the padded status word in
+// line with the given color. The word is matched as a whole, space-delimited
+// token (the only place a bare status word stands alone in a laid-out row) so a
+// coincidental substring in the host or note column is left untouched. Because
+// the surrounding spaces and the word's visible width are unchanged, the column
+// alignment computed by tabwriter is preserved.
+func colorizeStatusCell(line, word, color string) string {
+	if word == "" || color == "" {
+		return line
+	}
+	idx := strings.Index(line, word)
+	for idx >= 0 {
+		before := idx == 0 || line[idx-1] == ' '
+		end := idx + len(word)
+		after := end >= len(line) || line[end] == ' ' || line[end] == '\n'
+		if before && after {
+			return line[:idx] + color + word + colorReset + line[end:]
+		}
+		next := strings.Index(line[idx+1:], word)
+		if next < 0 {
+			break
+		}
+		idx = idx + 1 + next
+	}
+	return line
 }
 
 // rowIsHealthy reports whether a batch row needs no attention: a successful scan
@@ -382,12 +482,7 @@ func rowIsHealthy(row BatchRow) bool {
 	if row.Err != "" {
 		return false
 	}
-	r := row.Report
-	return r.ChainTrusted &&
-		r.HostnameMatch &&
-		!r.Leaf.Expired &&
-		!r.Leaf.NotYetValid &&
-		r.Leaf.DaysRemaining > r.WarnDays
+	return row.Report.Healthy()
 }
 
 // WriteBatchJSON renders the batch as a JSON array. Each healthy or unhealthy
@@ -435,13 +530,13 @@ func WriteBatchJSON(w io.Writer, rows []BatchRow, quiet bool) error {
 // column shows the leaf subject common name; the STATUS column summarizes
 // validity (VALID, EXPIRING Nd, EXPIRED, no TLS, or closed).
 func WriteSweepText(w io.Writer, sr *tlsscan.SweepResult, color bool) {
-	fmt.Fprintf(w, "%s %s\n\n", paint("tlsee sweep", colorBold, color), sr.Host)
+	fmt.Fprintf(w, "%s %s\n\n", paint("tlsee sweep", colorBold, color), sanitize(sr.Host))
 
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(tw, "PORT\tPROTO\tCERT\tSTATUS")
 	for _, p := range sr.Ports {
 		status, stColor := sweepStatus(p)
-		cert := p.SubjectCN
+		cert := sanitize(p.SubjectCN)
 		if cert == "" {
 			cert = "-"
 		}
@@ -492,12 +587,13 @@ func sanLiveness(c tlsscan.SANCheck) (addrs, state, color string) {
 	parts := make([]string, 0, len(c.Addrs))
 	anyUp, allUp := false, true
 	for _, a := range c.Addrs {
+		ip := sanitize(a.IP)
 		if a.Reachable {
 			anyUp = true
-			parts = append(parts, a.IP)
+			parts = append(parts, ip)
 		} else {
 			allUp = false
-			parts = append(parts, a.IP+" (down)")
+			parts = append(parts, ip+" (down)")
 		}
 	}
 	addrs = strings.Join(parts, ", ")

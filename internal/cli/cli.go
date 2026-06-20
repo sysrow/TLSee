@@ -37,7 +37,9 @@ const (
 	exitOK       = 0 // healthy certificate, or explicitly requested help (or a problem suppressed by --insecure)
 	exitError    = 1 // runtime error: bad flags, missing/extra args, unknown command, connection failure
 	exitCertProb = 2 // certificate problem, or usage shown for no-args
-	exitUsage    = 2 // usage shown for no-args
+	// exitUsage (no-args usage) intentionally shares exitCertProb's value;
+	// defining it in terms of exitCertProb keeps them from silently diverging.
+	exitUsage = exitCertProb
 )
 
 // Run parses args, dispatches the subcommand, renders output to stdout,
@@ -95,20 +97,22 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(file, "f", "", "shorthand for --file")
 	fs.BoolVar(quiet, "q", false, "shorthand for --quiet")
 
-	fs.Usage = func() { printScanUsage(stderr, fs) }
-
-	// Explicit help is the requested output: print it to stdout and succeed,
-	// matching the top-level help command and keeping the tool pipeable.
-	for _, a := range args {
-		if a == "-h" || a == "--help" {
-			printScanUsage(stdout, fs)
-			return exitOK
-		}
-	}
+	// Render usage ourselves to the correct stream; suppress flag's automatic
+	// usage so help and parse errors are handled explicitly below.
+	fs.Usage = func() {}
 
 	positional, err := parseInterspersed(fs, args)
 	if err != nil {
-		// A flag-parse error was already printed to stderr by the flag package.
+		// flag's own help handling covers -h, --help, -help and --h alike,
+		// returning ErrHelp. Explicit help is the requested output, so print it
+		// to stdout and succeed (and "scan host -- --help" treats --help as a
+		// literal target rather than a help request).
+		if errors.Is(err, flag.ErrHelp) {
+			printScanUsage(stdout, fs)
+			return exitOK
+		}
+		// A real flag-parse error was already printed to stderr by flag.
+		printScanUsage(stderr, fs)
 		return exitError
 	}
 
@@ -123,7 +127,12 @@ func runScan(args []string, stdout, stderr io.Writer) int {
 	}
 	if len(targets) == 0 {
 		fmt.Fprintln(stderr, "tlsee scan: "+errNoTargets.Error())
-		fs.Usage()
+		printScanUsage(stderr, fs)
+		return exitError
+	}
+
+	if err := validateStartTLS(*startTLS); err != nil {
+		fmt.Fprintf(stderr, "tlsee scan: %v\n", err)
 		return exitError
 	}
 
@@ -229,8 +238,15 @@ func scanTargets(ctx context.Context, targets []string, opts tlsscan.Options, wa
 	sem := make(chan struct{}, batchConcurrency)
 	var wg sync.WaitGroup
 	for i, target := range targets {
+		// Stop dispatching promptly on cancellation (Ctrl-C/SIGTERM); rows not
+		// yet scanned stay zero-valued and render as having no problem.
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return rows
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(i int, target string) {
 			defer wg.Done()
 			defer func() { <-sem }()
@@ -348,22 +364,21 @@ func runSweep(args []string, stdout, stderr io.Writer) int {
 		colorMode = fs.String("color", "auto", "color output: auto|always|never")
 	)
 
-	fs.Usage = func() { printSweepUsage(stderr, fs) }
-
-	for _, a := range args {
-		if a == "-h" || a == "--help" {
-			printSweepUsage(stdout, fs)
-			return exitOK
-		}
-	}
+	// Render usage ourselves; suppress flag's automatic usage.
+	fs.Usage = func() {}
 
 	hosts, err := parseInterspersed(fs, args)
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			printSweepUsage(stdout, fs)
+			return exitOK
+		}
+		printSweepUsage(stderr, fs)
 		return exitError
 	}
 	if len(hosts) != 1 {
 		fmt.Fprintln(stderr, "tlsee sweep: exactly one host is required")
-		fs.Usage()
+		printSweepUsage(stderr, fs)
 		return exitError
 	}
 	host := hosts[0]
@@ -426,19 +441,28 @@ func fullPortRange() []int {
 }
 
 // exitCodeForReport returns exitCertProb when the certificate is unhealthy
-// and exitOK otherwise. A certificate is healthy when the chain is
-// trusted, the hostname matches, it is currently valid, and it is not
-// within the warn window.
+// and exitOK otherwise, using the report's own Healthy predicate so the exit
+// code, the --quiet row filter, and the status all agree.
 func exitCodeForReport(r *tlsscan.Report) int {
-	healthy := r.ChainTrusted &&
-		r.HostnameMatch &&
-		!r.Leaf.Expired &&
-		!r.Leaf.NotYetValid &&
-		r.Leaf.DaysRemaining > r.WarnDays
-	if healthy {
+	if r.Healthy() {
 		return exitOK
 	}
 	return exitCertProb
+}
+
+// startTLSProtocols is the set of accepted --starttls values; the empty string
+// (direct TLS) is also valid and handled by validateStartTLS.
+var startTLSProtocols = map[string]bool{
+	"smtp": true, "imap": true, "pop3": true, "ftp": true, "postgres": true, "ldap": true,
+}
+
+// validateStartTLS rejects an unknown --starttls value up front, before any
+// network work, mirroring the up-front --color enum check.
+func validateStartTLS(proto string) error {
+	if proto == "" || startTLSProtocols[proto] {
+		return nil
+	}
+	return fmt.Errorf("invalid --starttls value %q (want smtp, imap, pop3, ftp, postgres, or ldap)", proto)
 }
 
 // resolveColor decides whether ANSI color should be emitted, honoring the

@@ -85,8 +85,14 @@ func TestParseTarget(t *testing.T) {
 		{name: "ipv6 with port", target: "[::1]:8443", wantHost: "::1", wantPort: "8443"},
 		{name: "ipv6 no port", target: "[::1]", wantHost: "::1", wantPort: "443"},
 		{name: "ipv6 scheme port and path", target: "https://[::1]:8443/health", wantHost: "::1", wantPort: "8443"},
+		{name: "bare ipv6 no brackets", target: "::1", wantHost: "::1", wantPort: "443"},
+		{name: "bare ipv6 global no brackets", target: "2001:db8::1", wantHost: "2001:db8::1", wantPort: "443"},
 		{name: "empty target", target: "", wantErr: true},
 		{name: "scheme only", target: "https://", wantErr: true},
+		{name: "port out of range", target: "example.com:99999", wantErr: true},
+		{name: "port zero", target: "example.com:0", wantErr: true},
+		{name: "non numeric port", target: "example.com:https", wantErr: true},
+		{name: "invalid default port", target: "example.com", defaultPort: "70000", wantErr: true},
 	}
 
 	for _, tc := range tests {

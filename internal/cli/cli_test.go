@@ -219,6 +219,32 @@ func TestRunDispatch(t *testing.T) {
 			wantStdoutOnly: true,
 		},
 		{
+			name:           "scan -help spelling also stdout exit 0",
+			args:           []string{"scan", "-help"},
+			wantCode:       exitOK,
+			wantStdoutHas:  "Usage: tlsee scan",
+			wantStdoutOnly: true,
+		},
+		{
+			name:           "scan --h spelling also stdout exit 0",
+			args:           []string{"scan", "--h"},
+			wantCode:       exitOK,
+			wantStdoutHas:  "Usage: tlsee scan",
+			wantStdoutOnly: true,
+		},
+		{
+			name:          "scan invalid --starttls rejected up front exit 1",
+			args:          []string{"scan", "example.com", "--starttls", "bogus"},
+			wantCode:      exitError,
+			wantStderrHas: "invalid --starttls",
+		},
+		{
+			name:          "sweep --help to stdout exit 0",
+			args:          []string{"sweep", "--help"},
+			wantCode:      exitOK,
+			wantStdoutHas: "Usage: tlsee sweep",
+		},
+		{
 			name:          "no args to stderr exit 2",
 			args:          []string{},
 			wantCode:      exitUsage,

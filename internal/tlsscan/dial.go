@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+// maxReplyBytes caps the total plaintext bytes read during a STARTTLS
+// negotiation. Protocol greetings and replies are tiny, so this bound only ever
+// trips a misbehaving or malicious server that withholds a line terminator.
+const maxReplyBytes = 64 << 10 // 64 KiB
+
 // dialPlaintext opens a plain TCP connection to addr, bounded by timeout. The
 // connect error is wrapped here so the wrap is shared by every caller (Scan,
 // per-IP probing, and the sweep engine) and matches the message tests assert.
@@ -86,24 +91,44 @@ func startTLSNegotiate(ctx context.Context, conn net.Conn, proto string, timeout
 		return err
 	}
 
-	br := bufio.NewReader(conn)
+	// Bound the plaintext reply stream so a malicious server cannot accumulate a
+	// huge newline-less line in the bufio buffer. Protocol greetings and replies
+	// are tiny, so a generous cap is safe and a server exceeding it fails fast
+	// (the LimitReader returns EOF, which surfaces as a read error).
+	br := bufio.NewReader(io.LimitReader(conn, maxReplyBytes))
 
+	var negErr error
 	switch strings.ToLower(proto) {
 	case "smtp":
-		return startTLSSMTP(conn, br)
+		negErr = startTLSSMTP(conn, br)
 	case "imap":
-		return startTLSIMAP(conn, br)
+		negErr = startTLSIMAP(conn, br)
 	case "pop3":
-		return startTLSPOP3(conn, br)
+		negErr = startTLSPOP3(conn, br)
 	case "ftp":
-		return startTLSFTP(conn, br)
+		negErr = startTLSFTP(conn, br)
 	case "postgres":
+		// Binary protocols read the conn directly and never buffer through br,
+		// so the leftover-data assertion below does not apply to them.
 		return startTLSPostgres(conn)
 	case "ldap":
 		return startTLSLDAP(conn)
 	default:
 		return fmt.Errorf("unknown starttls protocol %q", proto)
 	}
+	if negErr != nil {
+		return negErr
+	}
+
+	// Plaintext-injection hardening: after a successful line-based negotiation,
+	// the bufio reader must hold no leftover bytes. Buffered data here means the
+	// server sent application data before the TLS handshake (a known STARTTLS
+	// injection vector). Reject it rather than silently discarding it. The TLS
+	// handshake reads the raw conn, so br is intentionally not threaded forward.
+	if br.Buffered() != 0 {
+		return fmt.Errorf("server sent unexpected data before TLS")
+	}
+	return nil
 }
 
 // readReplyLine reads one CRLF-terminated line and returns it without the
@@ -168,7 +193,10 @@ func startTLSIMAP(conn net.Conn, br *bufio.Reader) error {
 	if err != nil {
 		return fmt.Errorf("read imap greeting: %w", err)
 	}
-	if !strings.HasPrefix(greeting, "* OK") {
+	// A usable greeting is "* OK" (connection ready) or "* PREAUTH" (already
+	// authenticated, e.g. by a local transport). "* BYE" and anything else mean
+	// the server is rejecting the session, so do not proceed.
+	if !strings.HasPrefix(greeting, "* OK") && !strings.HasPrefix(greeting, "* PREAUTH") {
 		return fmt.Errorf("imap greeting not OK: %q", greeting)
 	}
 	if _, err := io.WriteString(conn, "a1 STARTTLS\r\n"); err != nil {

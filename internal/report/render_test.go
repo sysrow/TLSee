@@ -3,12 +3,36 @@ package report
 import (
 	"bytes"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
 
 	"tlsee/internal/tlsscan"
 )
+
+// ansiPattern matches ANSI escape sequences (the color codes emitted by paint).
+// Tests strip these to reason about the visible width of table columns.
+var ansiPattern = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+// stripANSI removes ANSI escape sequences from s, leaving only visible text.
+func stripANSI(s string) string {
+	return ansiPattern.ReplaceAllString(s, "")
+}
+
+// hasControlBytes reports whether s contains any C0/C1 control byte or ESC,
+// excluding the newline and tab that legitimately structure rendered output.
+func hasControlBytes(s string) bool {
+	for _, r := range s {
+		if r == '\n' || r == '\t' {
+			continue
+		}
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return true
+		}
+	}
+	return false
+}
 
 // TestWriteTextChainCNOnly verifies the chain section renders one narrow line
 // per certificate using the common name, falling back to the full DN when the
@@ -323,7 +347,7 @@ func sweepFixture() *tlsscan.SweepResult {
 		Host: "example.com",
 		Ports: []tlsscan.PortResult{
 			{Port: 80, Proto: "tls", Open: false},
-			{Port: 443, Proto: "https", Open: true, TLS: true, SubjectCN: "example.com", NotAfter: notAfter, DaysRemaining: 90},
+			{Port: 443, Proto: "https", Open: true, TLS: true, SubjectCN: "example.com", NotAfter: &notAfter, DaysRemaining: 90},
 			{Port: 587, Proto: "smtp", Open: true, TLS: true, SubjectCN: "mail.example.com", DaysRemaining: 10},
 			{Port: 993, Proto: "imaps", Open: true, TLS: true, SubjectCN: "old.example.com", DaysRemaining: -2, Expired: true},
 			{Port: 22, Proto: "tls", Open: true, TLS: false, Error: "no TLS"},
@@ -406,5 +430,155 @@ func TestRowIsHealthyIgnoresDeadSANs(t *testing.T) {
 	}
 	if !rowIsHealthy(BatchRow{Host: "x", Report: r}) {
 		t.Errorf("row with dead SANs but valid cert should be healthy for quiet mode")
+	}
+}
+
+// TestWriteTextSanitizesControlBytes verifies that control characters embedded
+// in attacker-controlled certificate and target fields -- a server can put
+// arbitrary bytes in a Subject, Issuer, SAN name, CN, or verify error -- are
+// stripped from the rendered text output, so a malicious certificate cannot
+// inject ANSI escape sequences (screen clears, cursor moves, color forgery) or
+// other terminal control bytes. Rendered with color disabled, the output must
+// contain no raw control bytes while still showing the visible text.
+func TestWriteTextSanitizesControlBytes(t *testing.T) {
+	// ESC[2J clears the screen; CR returns the cursor to overwrite the line;
+	// BEL beeps. All three are classic terminal-injection payloads.
+	const esc = "\x1b[2J"
+	const cr = "\r"
+	const bel = "\a"
+
+	r := fixedReport()
+	r.Target = "evil" + esc + ".example.com"
+	r.Leaf.Subject = "CN=" + esc + "Spoofed"
+	r.Leaf.Issuer = "CN=Issuer" + bel
+	r.Leaf.DNSNames = []string{"good.example.com", "bad" + cr + ".example.com"}
+	r.VerifyError = "x509:" + esc + " forged error"
+	r.Chain = []tlsscan.CertInfo{
+		{SubjectCN: "Inter" + esc + "mediate", IssuerCN: "Root" + bel},
+		{Subject: "OU=" + cr + "Org", Issuer: "OU=Root"},
+	}
+	r.SANChecks = []tlsscan.SANCheck{
+		{Name: "san" + esc + ".example.com", Resolved: true, Reachable: true,
+			Addrs: []tlsscan.AddrCheck{{IP: "10.0.0.1" + bel, Reachable: true}}},
+	}
+	r.IPCerts = []tlsscan.IPCert{
+		{IP: "10.0.0.2", SubjectCN: "ip" + esc + "cert", DaysRemaining: 90},
+		{IP: "10.0.0.3", Error: "boom" + cr + "overwrite"},
+	}
+
+	var buf bytes.Buffer
+	WriteText(&buf, r, false)
+	out := buf.String()
+
+	if hasControlBytes(out) {
+		t.Errorf("WriteText (color off) emitted raw control bytes from untrusted fields:\n%q", out)
+	}
+
+	// The visible text around the stripped control bytes must survive. Only the
+	// control byte itself is removed; the printable remainder of an escape
+	// sequence (for example the "[2J" after ESC) is left in place, which is
+	// harmless once the ESC that would activate it is gone.
+	for _, want := range []string{
+		"evil[2J.example.com", // ESC stripped, printable "[2J" remains
+		"CN=[2JSpoofed",       // ESC removed, surrounding text kept
+		"CN=Issuer",           // BEL removed
+		"bad.example.com",     // CR removed from SAN name
+		"x509:[2J forged error",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("sanitized output missing expected visible text %q\n---\n%s", want, out)
+		}
+	}
+}
+
+// TestBatchAndSweepTablesSanitizeControlBytes confirms the table paths
+// (WriteBatchTable, WriteSweepText) also strip control bytes from the
+// attacker-influenced host, error, and CN cells, so a malicious target cannot
+// forge the terminal through the batch or sweep summary.
+func TestBatchAndSweepTablesSanitizeControlBytes(t *testing.T) {
+	const esc = "\x1b[2J"
+	const bel = "\a"
+
+	rows := []BatchRow{
+		{Host: "host" + esc + ".example.com",
+			Report: &tlsscan.Report{ChainTrusted: true, HostnameMatch: true, WarnDays: 30, Leaf: tlsscan.CertInfo{DaysRemaining: 90}}},
+		{Host: "broken" + esc + ".example.com", Err: "dial" + bel + " failed"},
+	}
+	var batch bytes.Buffer
+	WriteBatchTable(&batch, rows, false, false)
+	if hasControlBytes(batch.String()) {
+		t.Errorf("WriteBatchTable emitted raw control bytes from untrusted cells:\n%q", batch.String())
+	}
+
+	sr := &tlsscan.SweepResult{
+		Host: "sweep" + esc + ".example.com",
+		Ports: []tlsscan.PortResult{
+			{Port: 443, Proto: "https", Open: true, TLS: true, SubjectCN: "cn" + bel + ".example.com", DaysRemaining: 90},
+		},
+	}
+	var sweep bytes.Buffer
+	WriteSweepText(&sweep, sr, false)
+	if hasControlBytes(sweep.String()) {
+		t.Errorf("WriteSweepText emitted raw control bytes from untrusted cells:\n%q", sweep.String())
+	}
+}
+
+// TestWriteBatchTableNoteAlignment verifies the NOTE column stays aligned with
+// its header even when STATUS cells are colored. tabwriter measures byte width,
+// so coloring inside the laid-out cell would otherwise count the invisible ANSI
+// escape bytes and push the colored rows' NOTE cell out of line with the header.
+// The layout must be computed on the uncolored cells; stripping ANSI from the
+// colored output must yield exactly the same column offsets as the monochrome
+// output.
+func TestWriteBatchTableNoteAlignment(t *testing.T) {
+	var mono bytes.Buffer
+	WriteBatchTable(&mono, batchRows(), false, false)
+
+	var colored bytes.Buffer
+	WriteBatchTable(&colored, batchRows(), true, false)
+
+	// Stripping color from the colored render must reproduce the monochrome
+	// render byte-for-byte: if alignment depended on the color codes, the
+	// padding would differ and these would not match.
+	if got, want := stripANSI(colored.String()), mono.String(); got != want {
+		t.Errorf("colored table (ANSI-stripped) does not match monochrome layout:\nstripped:\n%q\nmono:\n%q", got, want)
+	}
+
+	// Directly assert the NOTE column starts at the same offset on the header and
+	// on every data row, in both renders.
+	for _, tc := range []struct {
+		name string
+		out  string
+	}{
+		{"monochrome", mono.String()},
+		{"colored-stripped", stripANSI(colored.String())},
+	} {
+		lines := strings.Split(strings.TrimRight(tc.out, "\n"), "\n")
+		if len(lines) < 2 {
+			t.Fatalf("%s: table too short:\n%s", tc.name, tc.out)
+		}
+		noteOffset := strings.Index(lines[0], "NOTE")
+		if noteOffset < 0 {
+			t.Fatalf("%s: NOTE header not found:\n%s", tc.name, tc.out)
+		}
+		for _, line := range lines[1:] {
+			// The NOTE cell content begins exactly at noteOffset; everything to its
+			// left (HOST, DAYS, STATUS columns plus padding) is spaces from there
+			// back to the previous column. Assert the column boundary is not blank
+			// in the header position and that lines are at least that wide.
+			if len(line) < noteOffset {
+				t.Errorf("%s: data row shorter than NOTE column offset %d:\n%q", tc.name, noteOffset, line)
+				continue
+			}
+			// The character just before the NOTE column must be a space (column
+			// separator); the NOTE cell itself must be non-space (real content),
+			// proving the columns line up rather than drifting.
+			if noteOffset > 0 && line[noteOffset-1] != ' ' {
+				t.Errorf("%s: NOTE column not aligned at offset %d (no separator):\n%q", tc.name, noteOffset, line)
+			}
+			if line[noteOffset] == ' ' {
+				t.Errorf("%s: NOTE column at offset %d is blank (misaligned):\n%q", tc.name, noteOffset, line)
+			}
+		}
 	}
 }

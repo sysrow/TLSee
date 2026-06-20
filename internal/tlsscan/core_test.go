@@ -526,11 +526,16 @@ func TestStartTLSNegotiateUnknownProto(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	defer ln.Close()
+	// Keep the accepted connection open until the test finishes. The unknown
+	// proto is rejected before any I/O, so no server-side dialog (and no timed
+	// sleep) is needed.
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
 	go func() {
 		conn, err := ln.Accept()
 		if err == nil {
 			defer conn.Close()
-			time.Sleep(50 * time.Millisecond)
+			<-done
 		}
 	}()
 	conn := dialScript(t, ln.Addr().String())
@@ -601,8 +606,8 @@ func TestSweepTLSSuccess(t *testing.T) {
 	if pr.Error != "" {
 		t.Errorf("Error = %q; want empty", pr.Error)
 	}
-	if pr.NotAfter.IsZero() {
-		t.Errorf("NotAfter is zero; want a parsed expiry")
+	if pr.NotAfter == nil {
+		t.Errorf("NotAfter is nil; want a parsed expiry")
 	}
 	// A non-curated port attempts direct TLS, so the proto label falls back.
 	if pr.Proto != "tls" {
@@ -624,15 +629,15 @@ func TestProbeIPCertSuccess(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	res := probeIPCert(ctx, "127.0.0.1", portStr, "127.0.0.1", 5*time.Second)
+	res := probeIPCert(ctx, "127.0.0.1", portStr, "127.0.0.1", "", 5*time.Second)
 	if res.Error != "" {
 		t.Fatalf("Error = %q; want empty", res.Error)
 	}
 	if res.FingerprintSHA256 == "" {
 		t.Errorf("FingerprintSHA256 is empty; want a populated fingerprint")
 	}
-	if res.NotAfter.IsZero() {
-		t.Errorf("NotAfter is zero; want a parsed expiry")
+	if res.NotAfter == nil {
+		t.Errorf("NotAfter is nil; want a parsed expiry")
 	}
 }
 
@@ -648,7 +653,7 @@ func TestProbeIPCertRefused(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	res := probeIPCert(ctx, "127.0.0.1", portStr, "127.0.0.1", time.Second)
+	res := probeIPCert(ctx, "127.0.0.1", portStr, "127.0.0.1", "", time.Second)
 	if res.Error == "" {
 		t.Errorf("Error is empty; want a connection error for a closed port")
 	}
@@ -694,6 +699,34 @@ func mustAtoi(t *testing.T, s string) int {
 		n = n*10 + int(c-'0')
 	}
 	return n
+}
+
+// TestCheckSANsCapAndSeam exercises the SAN-name cap and the injectable
+// resolver seam: names beyond maxSANChecks are not probed (and reported as such),
+// and swapping lookupIP lets the test resolve without real DNS.
+func TestCheckSANsCapAndSeam(t *testing.T) {
+	orig := lookupIP
+	lookupIP = func(_ context.Context, _, _ string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("127.0.0.1")}, nil
+	}
+	t.Cleanup(func() { lookupIP = orig })
+
+	names := make([]string, maxSANChecks+5)
+	for i := range names {
+		names[i] = "host.example"
+	}
+	// Port 1 is closed, so probes resolve (via the seam) but are unreachable;
+	// the test only asserts the cap and the seam, not reachability.
+	checks, notProbed := checkSANs(context.Background(), names, "1", 200*time.Millisecond)
+	if len(checks) != maxSANChecks {
+		t.Errorf("probed %d names; want cap of %d", len(checks), maxSANChecks)
+	}
+	if notProbed != 5 {
+		t.Errorf("notProbed = %d; want 5", notProbed)
+	}
+	if len(checks) == 0 || !checks[0].Resolved {
+		t.Errorf("resolver seam not used: first name should resolve via the fake resolver")
+	}
 }
 
 // testTLSCert borrows the certificate httptest generates so the STARTTLS-then-
@@ -791,8 +824,8 @@ func TestProbePortSTARTTLS(t *testing.T) {
 	if !res.TLS {
 		t.Errorf("TLS = false (err=%q); want true after STARTTLS", res.Error)
 	}
-	if res.NotAfter.IsZero() {
-		t.Errorf("NotAfter is zero; want a parsed expiry")
+	if res.NotAfter == nil {
+		t.Errorf("NotAfter is nil; want a parsed expiry")
 	}
 	<-done
 }
@@ -851,7 +884,7 @@ func TestProbeIPCertsOrchestrator(t *testing.T) {
 		t.Fatalf("split host port: %v", err)
 	}
 
-	certs, differ := probeIPCerts(context.Background(), "127.0.0.1", portStr, "127.0.0.1",
+	certs, differ := probeIPCerts(context.Background(), "127.0.0.1", portStr, "127.0.0.1", "",
 		[]string{"127.0.0.1", "127.0.0.1"}, 5*time.Second)
 	if len(certs) != 2 {
 		t.Fatalf("got %d IPCerts; want 2", len(certs))
@@ -864,4 +897,110 @@ func TestProbeIPCertsOrchestrator(t *testing.T) {
 			t.Errorf("unexpected per-IP result: %+v", c)
 		}
 	}
+}
+
+// TestProbeIPCertSTARTTLS proves the per-IP probe used by --all-ips honors a
+// STARTTLS mechanism: it negotiates the SMTP upgrade against a scripted server
+// and then completes the handshake, returning a populated fingerprint. Without
+// the proto wiring this path would attempt a direct TLS handshake against the
+// plaintext SMTP greeting and fail.
+func TestProbeIPCertSTARTTLS(t *testing.T) {
+	addr, done := runSMTPStartTLSServer(t, testTLSCert(t))
+	_, portStr, _ := net.SplitHostPort(addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res := probeIPCert(ctx, "127.0.0.1", portStr, "127.0.0.1", "smtp", 5*time.Second)
+	if res.Error != "" {
+		t.Fatalf("Error = %q; want empty for a STARTTLS server", res.Error)
+	}
+	if res.FingerprintSHA256 == "" {
+		t.Errorf("FingerprintSHA256 is empty; want a populated fingerprint after STARTTLS")
+	}
+	<-done
+}
+
+// TestStartTLSNegotiateReplyTooLong asserts the reply read is bounded: a server
+// that floods bytes without a line terminator cannot make the negotiator buffer
+// unbounded memory. The flood exceeds maxReplyBytes, so the LimitReader reaches
+// EOF before a newline and the read fails instead of growing without limit.
+func TestStartTLSNegotiateReplyTooLong(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		// Send well over maxReplyBytes (64 KiB) with no '\n' so the client can
+		// never complete a line. Ignore write errors: once the client gives up
+		// and closes, the remaining writes fail, which is expected.
+		flood := make([]byte, 128<<10)
+		for i := range flood {
+			flood[i] = 'A'
+		}
+		_, _ = conn.Write(flood)
+	}()
+
+	conn := dialScript(t, ln.Addr().String())
+	defer conn.Close()
+	if err := startTLSNegotiate(context.Background(), conn, "smtp", 3*time.Second); err == nil {
+		t.Fatal("startTLSNegotiate(smtp) = nil; want error for an oversized newline-less reply")
+	}
+	<-done
+}
+
+// TestStartTLSNegotiateIMAPPreauth asserts a "* PREAUTH" greeting is accepted
+// (RFC 3501 permits it), while a "* BYE" greeting is rejected.
+func TestStartTLSNegotiateIMAPPreauth(t *testing.T) {
+	t.Run("preauth accepted", func(t *testing.T) {
+		addr, done := runScriptedServer(t, []scriptStep{
+			{send: "* PREAUTH [CAPABILITY IMAP4rev1 STARTTLS] ready\r\n", expect: "a1 STARTTLS"},
+			{send: "a1 OK Begin TLS negotiation now\r\n"},
+		})
+		conn := dialScript(t, addr)
+		defer conn.Close()
+		if err := startTLSNegotiate(context.Background(), conn, "imap", 2*time.Second); err != nil {
+			t.Fatalf("startTLSNegotiate(imap) error for PREAUTH greeting: %v", err)
+		}
+		<-done
+	})
+
+	t.Run("bye rejected", func(t *testing.T) {
+		addr, done := runScriptedServer(t, []scriptStep{
+			{send: "* BYE server shutting down\r\n"},
+		})
+		conn := dialScript(t, addr)
+		defer conn.Close()
+		if err := startTLSNegotiate(context.Background(), conn, "imap", 2*time.Second); err == nil {
+			t.Fatal("startTLSNegotiate(imap) = nil; want error for a * BYE greeting")
+		}
+		<-done
+	})
+}
+
+// TestStartTLSNegotiateInjection asserts plaintext-injection hardening: when the
+// server sends application data immediately after the final STARTTLS reply (in a
+// single write, so loopback delivers it in one read and the client buffers it),
+// the negotiator rejects it rather than proceeding to a handshake over
+// attacker-influenced state.
+func TestStartTLSNegotiateInjection(t *testing.T) {
+	addr, done := runScriptedServer(t, []scriptStep{
+		{send: "* OK ready\r\n", expect: "a1 STARTTLS"},
+		// The tagged OK and the injected line arrive in one write.
+		{send: "a1 OK begin\r\nINJECTED PLAINTEXT\r\n"},
+	})
+	conn := dialScript(t, addr)
+	defer conn.Close()
+	if err := startTLSNegotiate(context.Background(), conn, "imap", 2*time.Second); err == nil {
+		t.Fatal("startTLSNegotiate(imap) = nil; want error for buffered data before TLS")
+	}
+	<-done
 }

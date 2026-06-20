@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"tlsee/internal/tlsscan"
+	"github.com/sysrow/tlsee/internal/tlsscan"
 )
 
 // ansiPattern matches ANSI escape sequences (the color codes emitted by paint).

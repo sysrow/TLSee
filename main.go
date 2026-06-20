@@ -9,7 +9,7 @@ package main
 import (
 	"os"
 
-	"tlsee/internal/cli"
+	"github.com/sysrow/tlsee/internal/cli"
 )
 
 func main() {

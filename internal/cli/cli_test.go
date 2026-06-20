@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"tlsee/internal/tlsscan"
+	"github.com/sysrow/tlsee/internal/tlsscan"
 )
 
 // TestParseInterspersed verifies positional targets are extracted no matter

@@ -15,7 +15,7 @@ import (
 	"text/tabwriter"
 	"unicode"
 
-	"tlsee/internal/tlsscan"
+	"github.com/sysrow/tlsee/internal/tlsscan"
 )
 
 // ANSI color codes used only when color output is enabled.

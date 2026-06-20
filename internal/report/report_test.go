@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"tlsee/internal/tlsscan"
+	"github.com/sysrow/tlsee/internal/tlsscan"
 )
 
 // fixedReport returns a deterministic report fixture. All time values are

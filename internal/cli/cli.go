@@ -18,12 +18,14 @@ import (
 	"syscall"
 	"time"
 
-	"tlsee/internal/report"
-	"tlsee/internal/tlsscan"
+	"github.com/sysrow/tlsee/internal/report"
+	"github.com/sysrow/tlsee/internal/tlsscan"
 )
 
-// version is the tool's version string, printed by the version subcommand.
-const version = "tlsee 0.1.0"
+// version is the tool's version, printed by the version subcommand. It defaults
+// to "dev" for local builds and is overridden at release time with the git tag
+// via -ldflags "-X 'github.com/sysrow/tlsee/internal/cli.version=v1.2.3'".
+var version = "dev"
 
 // batchConcurrency caps how many hosts are scanned at once in batch mode.
 const batchConcurrency = 16
@@ -57,7 +59,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	case "sweep":
 		return runSweep(args[1:], stdout, stderr)
 	case "version":
-		fmt.Fprintln(stdout, version)
+		fmt.Fprintf(stdout, "tlsee %s\n", version)
 		return exitOK
 	case "help", "-h", "--help":
 		// Help was explicitly requested, so it is the requested output:

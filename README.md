@@ -27,11 +27,18 @@ service behind them was decommissioned.
 
 Built with the Go standard library only. No third-party dependencies.
 
-## Build
+## Install
 
 ```bash
+# Install the latest release with the Go toolchain
+go install github.com/sysrow/tlsee@latest
+
+# Or build from a clone
 go build -o tlsee .
 ```
+
+Prebuilt binaries for Linux, macOS, and Windows (amd64/arm64) are attached to
+each [GitHub release](https://github.com/sysrow/tlsee/releases).
 
 ## Usage
 

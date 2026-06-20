@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"tlsee/internal/report"
-	"tlsee/internal/tlsscan"
+	"github.com/sysrow/tlsee/internal/report"
+	"github.com/sysrow/tlsee/internal/tlsscan"
 )
 
 // TestParseHostList verifies blank lines, comment lines, and surrounding

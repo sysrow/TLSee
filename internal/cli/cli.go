@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,6 +27,21 @@ import (
 // to "dev" for local builds and is overridden at release time with the git tag
 // via -ldflags "-X 'github.com/sysrow/tlsee/internal/cli.version=v1.2.3'".
 var version = "dev"
+
+// toolVersion returns the version to report. Release binaries set version via
+// ldflags. For a binary produced by "go install module@vX.Y.Z" no ldflags are
+// applied, so fall back to the module version embedded in the build info.
+func toolVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if v := info.Main.Version; v != "" && v != "(devel)" {
+			return v
+		}
+	}
+	return version
+}
 
 // batchConcurrency caps how many hosts are scanned at once in batch mode.
 const batchConcurrency = 16
@@ -59,7 +75,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	case "sweep":
 		return runSweep(args[1:], stdout, stderr)
 	case "version":
-		fmt.Fprintf(stdout, "tlsee %s\n", version)
+		fmt.Fprintf(stdout, "tlsee %s\n", toolVersion())
 		return exitOK
 	case "help", "-h", "--help":
 		// Help was explicitly requested, so it is the requested output:
